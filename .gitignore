@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+
+# Project logs
+*.log
+
+# Parsed outputs / temporary reports
+*_parsed.csv
+*_parsed.xlsx
+results/
+output/
+
+# VS Code / IDE configs
+.vscode/
+.idea/
