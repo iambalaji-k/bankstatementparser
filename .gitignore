@@ -21,3 +21,15 @@ output/
 # VS Code / IDE configs
 .vscode/
 .idea/
+
+
+# Added by cargo
+
+/target
+
+
+# Command Code
+.commandcode/
+
+# pdf
+*.pdf
