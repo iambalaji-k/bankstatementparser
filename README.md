@@ -1,6 +1,6 @@
-# Bank Statement PDF Parser (HDFC / SBI / IOB)
+# Bank Statement PDF Parser (HDFC / SBI / IOB / Canara)
 
-A high-performance parser to convert **HDFC**, **SBI**, and **Indian Overseas Bank** PDF statements into clean, structured CSV and Excel (.xlsx) formats. Handles multi-line narrations, page-boundary overflows, reverse-chronological ordering, and mixed withdrawal/deposit alignments with **100% mathematical consistency**.
+A high-performance parser to convert **HDFC**, **SBI**, **Indian Overseas Bank**, and **Canara Bank** PDF statements into clean, structured CSV and Excel (.xlsx) formats. Handles multi-line narrations, page-boundary overflows, reverse-chronological ordering, and mixed withdrawal/deposit alignments with **100% mathematical consistency**.
 
 Available in both **Rust** (recommended) and **Python** versions.
 
@@ -60,13 +60,13 @@ The binary will be at `target/release/hdfc-parser.exe` (Windows) or `target/rele
 python parser.py "statement.pdf"
 ```
 
-**Auto-detection:** The parser reads page 1 and detects the bank automatically. Pass `--bank hdfc|sbi|iob` to override.
+**Auto-detection:** The parser reads page 1 and detects the bank automatically. Pass `--bank hdfc|sbi|iob|canara` to override.
 
 | Option | Description |
 |--------|-------------|
 | `--csv PATH` | Specify custom output path for CSV |
 | `--xlsx PATH` | Specify custom output path for Excel |
-| `--bank hdfc|sbi|iob` | Manually specify bank (auto-detected by default) |
+| `--bank hdfc|sbi|iob|canara` | Manually specify bank (auto-detected by default) |
 | `--verbose` | Enable detailed processing logs |
 
 ---

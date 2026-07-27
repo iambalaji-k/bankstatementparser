@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Multi-Bank PDF Statement Parser
-Converts HDFC/SBI/IOB bank statement PDFs to CSV/Excel using coordinate-based layout parsing.
+Converts HDFC/SBI/IOB/Canara bank statement PDFs to CSV/Excel using coordinate-based layout parsing.
 Author: Antigravity AI
 """
 
@@ -40,7 +40,7 @@ except ImportError:
 
 
 class BankStatementParser:
-    """Unified parser for HDFC and SBI bank statement PDFs with auto-detection."""
+    """Unified parser for HDFC, SBI, IOB, and Canara bank statement PDFs with auto-detection."""
 
     def __init__(self, pdf_path, verbose=False, bank=None):
         self.pdf_path = pdf_path
@@ -67,6 +67,8 @@ class BankStatementParser:
                 return "sbi"
             if "indian overseas bank" in text_lower or "ioba" in text_lower:
                 return "iob"
+            if "canara bank" in text_lower or "e-pass sheet" in text_lower:
+                return "canara"
             if "hdfc bank" in text_lower:
                 return "hdfc"
             return "hdfc"  # default
@@ -111,6 +113,14 @@ class BankStatementParser:
                 except Exception as e:
                     print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
             return self.parse_iob_pdfplumber()
+        elif self.bank == "canara":
+            print(f"Detected bank: Canara Bank")
+            if HAS_FITZ:
+                try:
+                    return self.parse_canara_fitz()
+                except Exception as e:
+                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
+            return self.parse_canara_pdfplumber()
         else:
             print(f"Detected bank: HDFC")
             if HAS_FITZ:
@@ -611,24 +621,37 @@ class BankStatementParser:
                                 continue
                             cline = sorted(grouped_lines[ck], key=lambda w: w[0])
                             for w in cline:
-                                if 112 <= w[0] < 278:
+                                if 111 <= w[0] < 278:
                                     narration_lines.append(w[4])
                         # Also collect from the date line itself
                         dline = sorted(grouped_lines[gk], key=lambda w: w[0])
                         for w in dline:
-                            if 112 <= w[0] < 278:
+                            if 111 <= w[0] < 278:
                                 narration_lines.append(w[4])
+                        # Also collect narration from val-date lines (between date and detail)
                         for vk in sorted_ys:
                             if vk <= gk or vk >= dk:
                                 continue
                             if vk in line_vd:
                                 val_date_text = line_vd[vk]
+                                vdline = sorted(grouped_lines[vk], key=lambda w: w[0])
+                                for w in vdline:
+                                    if 111 <= w[0] < 278:
+                                        narration_lines.append(w[4])
                         break
+
+                # Also collect narration from the detail line itself (x 111-278)
+                dk_narration = [w[4] for w in dk_line if 111 <= w[0] < 278]
+                full_narration = " ".join(narration_lines).strip()
+                if dk_narration:
+                    dk_narration_text = " ".join(dk_narration).strip()
+                    if dk_narration_text and dk_narration_text not in full_narration:
+                        full_narration = dk_narration_text + (" " + full_narration if full_narration else "")
 
                 if date_text:
                     transactions.append({
                         'date': date_text,
-                        'narration': " ".join(narration_lines).strip(),
+                        'narration': full_narration,
                         'chq_ref': " ".join(ref_parts).strip(),
                         'val_date': val_date_text if val_date_text else date_text,
                         'withdrawal': self.clean_amount(wd_val),
@@ -742,23 +765,36 @@ class BankStatementParser:
                                     continue
                                 cline = sorted(grouped_lines[ck], key=lambda w: w['x0'])
                                 for w in cline:
-                                    if 112 <= w['x0'] < 278:
+                                    if 111 <= w['x0'] < 278:
                                         narration_lines.append(w['text'])
                             dline = sorted(grouped_lines[gk], key=lambda w: w['x0'])
                             for w in dline:
-                                if 112 <= w['x0'] < 278:
+                                if 111 <= w['x0'] < 278:
                                     narration_lines.append(w['text'])
+                            # Also collect narration from val-date lines
                             for vk in sorted_ys:
                                 if vk <= gk or vk >= dk:
                                     continue
                                 if vk in line_vd:
                                     val_date_text = line_vd[vk]
+                                    vdline = sorted(grouped_lines[vk], key=lambda w: w['x0'])
+                                    for w in vdline:
+                                        if 111 <= w['x0'] < 278:
+                                            narration_lines.append(w['text'])
                             break
+
+                    # Also collect narration from the detail line itself (x 111-278)
+                    dk_narration = [w['text'] for w in dk_line if 111 <= w['x0'] < 278]
+                    full_narration = " ".join(narration_lines).strip()
+                    if dk_narration:
+                        dk_narration_text = " ".join(dk_narration).strip()
+                        if dk_narration_text and dk_narration_text not in full_narration:
+                            full_narration = dk_narration_text + (" " + full_narration if full_narration else "")
 
                     if date_text:
                         transactions.append({
                             'date': date_text,
-                            'narration': " ".join(narration_lines).strip(),
+                            'narration': full_narration,
                             'chq_ref': " ".join(ref_parts).strip(),
                             'val_date': val_date_text if val_date_text else date_text,
                             'withdrawal': self.clean_amount(wd_val),
@@ -776,6 +812,229 @@ class BankStatementParser:
             result.extend(reversed(page_groups[p]))
         print(f"Extraction complete. Found {len(result)} raw transactions.")
         return result
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Canara Bank Parsing (e-Pass Sheet)
+    #  Chronological order, DD-Mon-YY dates, block-based layout
+    # ═══════════════════════════════════════════════════════════════════
+
+    def parse_canara_fitz(self):
+        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
+        transactions = []
+        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
+        amount_re = re.compile(r'^-?\d+(?:,\d{3})*\.\d{2}$')
+
+        doc = fitz.open(self.pdf_path)
+        total_pages = len(doc)
+        print(f"Total pages to parse (Canara): {total_pages}")
+
+        for page_idx in range(total_pages):
+            page = doc[page_idx]
+            page_num = page_idx + 1
+
+            if self.verbose or page_num % 10 == 0 or page_num == total_pages:
+                print(f"Processing page {page_num}/{total_pages}...")
+
+            raw_text = page.get_text()
+            lines = raw_text.split('\n')
+
+            # Check if page has any date lines; skip summary pages
+            has_any_date = any(date_pattern.match(l.strip()) for l in lines)
+            if not has_any_date:
+                continue
+
+            date_text = ""
+            narration_lines = []
+            tx_amount = None
+            balance_val = None
+            amounts_seen = 0
+            page_txs = []
+
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                # Skip headers/footers
+                if any(kw in line for kw in ['Txn Date', 'Txn Description', 'Debit', 'Credit', 'Balance',
+                                              'e-Pass Sheet', 'Customer Name', 'Account Number',
+                                              'Report Generated', 'ADDRESS', 'Branch', 'Account Type',
+                                              'Currency', 'OPENING_BALANCE',
+                                              'Total:', 'Opening Balance', 'Closing Balance',
+                                              'Dr Count', 'Cr Count', 'Dr amount', 'Cr amount',
+                                              'UNLESS THE', 'COMPUTER OUTPUT', 'End of Statement',
+                                              'Page ']):
+                    continue
+
+                if date_pattern.match(line):
+                    # Flush previous transaction
+                    if date_text and tx_amount is not None and balance_val is not None:
+                        page_txs.append(self._build_canara_tx(
+                            date_text, narration_lines, tx_amount, balance_val, page_num))
+                    date_text = line
+                    narration_lines = []
+                    tx_amount = None
+                    balance_val = None
+                    amounts_seen = 0
+                elif amount_re.match(line):
+                    fval = float(line.replace(',', ''))
+                    amounts_seen += 1
+                    if amounts_seen == 1:
+                        tx_amount = fval
+                    elif amounts_seen == 2:
+                        balance_val = fval
+                else:
+                    narration_lines.append(line)
+
+            # Flush last transaction
+            if date_text and tx_amount is not None and balance_val is not None:
+                page_txs.append(self._build_canara_tx(
+                    date_text, narration_lines, tx_amount, balance_val, page_num))
+
+            transactions.extend(page_txs)
+
+        doc.close()
+        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
+        return transactions
+
+    def _build_canara_tx(self, date_text, narration_lines, tx_amount, balance, page):
+        """Build a transaction dict from Canara parsed components.
+        Determines debit vs credit from narration content."""
+        narration = " ".join(narration_lines).strip() if narration_lines else ""
+        n_lower = narration.lower()
+        # Credit indicators: UPI/CR/, NEFT CR-, NACH, CASH DEPOSIT, SBINT (interest),
+        # DISBURSEMENT, REFUND, CREDIT, BY (clearing), REV (reversal)
+        if any(kw in n_lower for kw in ['upi/cr/', 'neft cr', 'neft/',
+                                         'nach ', 'sbint ', 'cash deposit',
+                                         'disbursement', 'refund', 'credit',
+                                         ' by clg', 'by clg', 'rev :']):
+            debit_val = None
+            credit_val = tx_amount
+        else:
+            debit_val = tx_amount
+            credit_val = None
+        return {
+            'date': date_text,
+            'narration': narration,
+            'chq_ref': '',
+            'val_date': date_text,
+            'withdrawal': debit_val,
+            'deposit': credit_val,
+            'balance': balance,
+            'page': page,
+        }
+
+    def parse_canara_pdfplumber(self):
+        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
+        transactions = []
+        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
+
+        with pdfplumber.open(self.pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            print(f"Total pages to parse (Canara): {total_pages}")
+
+            for page_idx in range(total_pages):
+                page = pdf.pages[page_idx]
+                page_num = page_idx + 1
+
+                if self.verbose or page_num % 10 == 0 or page_num == total_pages:
+                    print(f"Processing page {page_num}/{total_pages}...")
+
+                words = page.extract_words()
+                # Filter to table region
+                table_words = [w for w in words if w['top'] >= 230]
+
+                # Group by y-coordinate
+                grouped_lines = {}
+                for w in table_words:
+                    top_val = w['top']
+                    found = False
+                    for gk in grouped_lines.keys():
+                        if abs(gk - top_val) < 2.0:
+                            grouped_lines[gk].append(w)
+                            found = True
+                            break
+                    if not found:
+                        grouped_lines[top_val] = [w]
+
+                sorted_ys = sorted(grouped_lines.keys())
+
+                # Find date lines
+                date_ys = []
+                for gk in sorted_ys:
+                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
+                    # Date is at x 30-80
+                    date_text = " ".join(w['text'] for w in line_words if 30 <= w['x0'] <= 80).strip()
+                    if date_pattern.match(date_text):
+                        date_ys.append(gk)
+
+                if not date_ys:
+                    continue  # summary/footer page
+
+                # For each date, collect narration and amounts
+                for i, dy in enumerate(date_ys):
+                    block_end = date_ys[i + 1] if i + 1 < len(date_ys) else (sorted_ys[-1] + 1)
+
+                    # Collect all lines between this date and the next
+                    block_ys = [gk for gk in sorted_ys if dy <= gk < block_end]
+
+                    # Date text from the date line
+                    date_line = sorted(grouped_lines[dy], key=lambda w: w['x0'])
+                    date_text = " ".join(w['text'] for w in date_line if 30 <= w['x0'] <= 80).strip()
+
+                    narration_parts = []
+                    debit_val = None
+                    credit_val = None
+                    balance_val = None
+
+                    for gk in block_ys:
+                        line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
+                        line_text = " ".join(w['text'] for w in line_words).strip()
+
+                        # Skip header rows
+                        if line_text in ('Txn Date', 'Txn Description', 'Debit', 'Credit', 'Balance'):
+                            continue
+                        if line_text.startswith('OPENING_BALANCE') or \
+                           any(kw in line_text for kw in ['Total:', 'Opening Balance', 'Closing Balance',
+                                                           'Dr Count', 'Cr Count', 'Dr amount', 'Cr amount',
+                                                           'UNLESS THE', 'COMPUTER OUTPUT', 'End of Statement']):
+                            continue
+
+                        # Check if this is an amount line (has values at x >= 310)
+                        amt_words = [w for w in line_words if w['x0'] >= 310]
+                        if amt_words:
+                            for w in amt_words:
+                                x = w['x0']
+                                try:
+                                    fval = float(w['text'].replace(',', ''))
+                                except ValueError:
+                                    continue
+                                if 320 <= x < 424:
+                                    debit_val = fval
+                                elif 424 <= x < 515:
+                                    credit_val = fval
+                                elif x >= 515:
+                                    balance_val = fval
+                        else:
+                            # Narration line
+                            n_words = [w['text'] for w in line_words if 100 <= w['x0'] < 160]
+                            if n_words:
+                                narration_parts.append(" ".join(n_words).strip())
+
+                    if date_text:
+                        transactions.append({
+                            'date': date_text,
+                            'narration': " ".join(narration_parts).strip(),
+                            'chq_ref': '',
+                            'val_date': date_text,
+                            'withdrawal': debit_val,
+                            'deposit': credit_val,
+                            'balance': balance_val,
+                            'page': page_num,
+                        })
+
+        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
+        return transactions
 
     # ═══════════════════════════════════════════════════════════════════
     #  Post-processing & output (shared by both banks)
@@ -938,11 +1197,11 @@ class BankStatementParser:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert Bank PDF Statement (HDFC/SBI/IOB) to CSV/Excel")
+    parser = argparse.ArgumentParser(description="Convert Bank PDF Statement (HDFC/SBI/IOB/Canara) to CSV/Excel")
     parser.add_argument("pdf_path", help="Path to Bank Statement PDF file")
     parser.add_argument("--csv", help="Output path for CSV file (default: pdf_name_parsed.csv)")
     parser.add_argument("--xlsx", help="Output path for Excel file (default: pdf_name_parsed.xlsx)")
-    parser.add_argument("--bank", choices=['hdfc', 'sbi', 'iob'], help="Bank type (auto-detected by default)")
+    parser.add_argument("--bank", choices=['hdfc', 'sbi', 'iob', 'canara'], help="Bank type (auto-detected by default)")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose log printing")
 
     args = parser.parse_args()
