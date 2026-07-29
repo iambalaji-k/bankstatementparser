@@ -5,12 +5,20 @@ Converts HDFC/SBI/IOB/Canara/Indian Bank statement PDFs to CSV/Excel using coord
 Author: Antigravity AI
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import re
 import csv
 import argparse
+import warnings
 from datetime import datetime
+from dataclasses import dataclass, field
+
+# Module-level compiled date sub-patterns
+MONTH_PATTERN = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$')
+YEAR_PATTERN = re.compile(r'^\d{4}$')
 
 # Try to import fitz (PyMuPDF) or pdfplumber
 HAS_FITZ = False
@@ -27,10 +35,6 @@ try:
 except ImportError:
     pass
 
-if not HAS_FITZ and not HAS_PDFPLUMBER:
-    print("Error: Neither 'pymupdf' nor 'pdfplumber' is installed. Please install at least one of them (e.g. 'pip install pymupdf').")
-    sys.exit(1)
-
 # Try to import openpyxl for Excel output
 try:
     import openpyxl
@@ -39,10 +43,169 @@ except ImportError:
     HAS_OPENPYXL = False
 
 
+class NormalizedWord:
+    """Standardized word wrapper for both PyMuPDF and pdfplumber."""
+    __slots__ = ('x0', 'top', 'x1', 'text')
+
+    def __init__(self, x0, top, x1, text):
+        self.x0 = float(x0)
+        self.top = float(top)
+        self.x1 = float(x1)
+        self.text = str(text)
+
+
+@dataclass
+class BankProfile:
+    """Declarative specification for bank-specific PDF layouts."""
+    name: str
+    display_name: str
+    date_pattern: re.Pattern
+    date_x_range: tuple[float, float]
+    col_bounds: dict[str, tuple[float, float] | None]
+    page1_min_y: float
+    pageN_min_y: float
+    max_y: float = 790.0
+    date_type: str = "single"  # "single", "split_3", "iob"
+    footer_keywords: list[str] = field(default_factory=list)
+    header_keywords: list[str] = field(default_factory=list)
+    chronological: bool = True
+    line_group_tolerance: float = 2.0
+    debit_dash_x_range: tuple[float, float] | None = None
+    credit_dash_x_range: tuple[float, float] | None = None
+    currency_prefix: str | None = None
+    vdate_pattern: re.Pattern | None = None
+    iob_block_offset_before: float = 6.0
+    iob_block_offset_after: float = 15.0
+
+
+BANK_PROFILES = {
+    'hdfc': BankProfile(
+        name='hdfc',
+        display_name='HDFC Bank',
+        date_pattern=re.compile(r'^\d{2}/\d{2}/\d{2,4}$'),
+        date_x_range=(30.0, 65.0),
+        col_bounds={
+            'date': (30.0, 65.0),
+            'narration': (65.0, 280.0),
+            'chq_ref': (280.0, 350.0),
+            'val_date': (350.0, 400.0),
+            'withdrawal': (400.0, 480.0),
+            'deposit': (480.0, 560.0),
+            'balance': (560.0, 630.0),
+        },
+        page1_min_y=225.0,
+        pageN_min_y=40.0,  # Fixed: Page 2+ starts table at top
+        max_y=780.0,
+        footer_keywords=['STATEMENT SUMMARY', 'TOTAL', 'CLOSING BALANCE'],
+        header_keywords=['Date', 'Narration', 'Chq/Ref']
+    ),
+    'sbi': BankProfile(
+        name='sbi',
+        display_name='State Bank of India (SBI)',
+        date_pattern=re.compile(r'^\d{2}/\d{2}/\d{4}$'),
+        date_x_range=(20.0, 78.0),
+        col_bounds={
+            'date': (20.0, 78.0),
+            'val_date': (78.0, 130.0),
+            'narration': (130.0, 290.0),
+            'chq_ref': (290.0, 335.0),
+            'withdrawal': (335.0, 410.0),
+            'deposit': (410.0, 485.0),
+            'balance': (485.0, 580.0),
+        },
+        page1_min_y=180.0,
+        pageN_min_y=40.0,
+        max_y=730.0,
+        footer_keywords=['Statement Summary', 'Total:', 'Closing Balance', 'Page ', 'This is a computer'],
+        header_keywords=['Txn Date', 'Value Date', 'Description', 'Ref No']
+    ),
+    'iob': BankProfile(
+        name='iob',
+        display_name='Indian Overseas Bank (IOB)',
+        date_pattern=re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$'),
+        vdate_pattern=re.compile(r'^\((\d{2}-[A-Z][a-z]{2}-\d{2})\)$'),
+        date_x_range=(40.0, 90.0),
+        col_bounds={
+            'date': (40.0, 90.0),
+            'narration': (90.0, 275.0),
+            'chq_ref': (275.0, 340.0),
+            'withdrawal': (395.0, 455.0),
+            'deposit': (455.0, 510.0),
+            'balance': (510.0, 600.0),
+        },
+        page1_min_y=260.0,
+        pageN_min_y=30.0,
+        max_y=790.0,
+        date_type='iob',
+        footer_keywords=['STATEMENT OF THE ACCOUNT', 'CUSTOMER DETAILS', 'Effective available balance', 'computer generated statement', 'Page '],
+        header_keywords=['Particulars', 'Ref No.', 'Debit(Rs)'],
+        chronological=False,
+        iob_block_offset_before=6.0,
+        iob_block_offset_after=15.0
+    ),
+    'canara': BankProfile(
+        name='canara',
+        display_name='Canara Bank',
+        date_pattern=re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$'),
+        date_x_range=(30.0, 95.0),
+        col_bounds={
+            'date': (30.0, 95.0),
+            'narration': (90.0, 310.0),
+            'chq_ref': None,
+            'val_date': None,
+            'withdrawal': (310.0, 424.0),
+            'deposit': (424.0, 515.0),
+            'balance': (515.0, 650.0),
+        },
+        page1_min_y=240.0,
+        pageN_min_y=10.0,
+        max_y=840.0,
+        footer_keywords=['Total:', 'Opening Balance', 'Closing Balance', 'Dr Count', 'Cr Count', 'UNLESS THE', 'COMPUTER OUTPUT', 'End of Statement'],
+        header_keywords=['Txn Date', 'Txn Description', 'Debit', 'Credit', 'Balance']
+    ),
+    'indianbank': BankProfile(
+        name='indianbank',
+        display_name='Indian Bank',
+        date_pattern=re.compile(r'^\d{2}$'),
+        date_x_range=(71.0, 124.0),
+        col_bounds={
+            'date': (71.0, 124.0),
+            'narration': (145.0, 260.0),
+            'chq_ref': None,
+            'val_date': None,
+            'withdrawal': (283.0, 330.0),
+            'deposit': (378.0, 425.0),
+            'balance': (470.0, 525.0),
+        },
+        page1_min_y=65.0,
+        pageN_min_y=65.0,
+        max_y=780.0,
+        date_type='split_3',
+        debit_dash_x_range=(305.0, 308.0),
+        credit_dash_x_range=(400.0, 403.0),
+        currency_prefix='INR'
+    )
+}
+
+
+def _matches_word_keyword(keyword: str, line_text: str) -> bool:
+    """Helper to check if a keyword matches in line text without false substring triggers or special character issues."""
+    if not keyword or not line_text:
+        return False
+    # If keyword has trailing space (e.g. 'Page '), match line prefix
+    if keyword.endswith(' '):
+        return line_text.strip().lower().startswith(keyword.strip().lower() + ' ')
+    kw_clean = keyword.strip()
+    pattern = r'(?:^|\s)' + re.escape(kw_clean) + r'(?:\s|$)'
+    return bool(re.search(pattern, line_text, re.IGNORECASE))
+
+
 class BankStatementParser:
-    """Unified parser for HDFC, SBI, IOB, and Canara bank statement PDFs with auto-detection."""
+    """Unified configuration-driven parser for HDFC, SBI, IOB, Canara, and Indian Bank statement PDFs."""
 
     def __init__(self, pdf_path, verbose=False, bank=None):
+        if not HAS_FITZ and not HAS_PDFPLUMBER:
+            raise ImportError("Neither 'pymupdf' nor 'pdfplumber' is installed. Please install at least one (e.g. 'pip install pymupdf').")
         self.pdf_path = pdf_path
         self.verbose = verbose
         if not os.path.exists(pdf_path):
@@ -53,15 +216,18 @@ class BankStatementParser:
 
     @staticmethod
     def detect_bank(pdf_path):
-        """Read page 1 text and detect the bank."""
+        """Read page 1 text and detect the bank using precise pattern matching."""
         try:
             if HAS_FITZ:
                 doc = fitz.open(pdf_path)
                 text = doc[0].get_text()
                 doc.close()
-            else:
+            elif HAS_PDFPLUMBER:
                 with pdfplumber.open(pdf_path) as pdf:
                     text = pdf.pages[0].extract_text() or ""
+            else:
+                text = ""
+
             text_lower = text.lower()
             if "state bank of india" in text_lower:
                 return "sbi"
@@ -69,22 +235,25 @@ class BankStatementParser:
                 return "iob"
             if "canara bank" in text_lower or "e-pass sheet" in text_lower:
                 return "canara"
-            if "indian bank" in text_lower or "indianbank" in text_lower or "idib" in text_lower:
+            if "indian overseas bank" not in text_lower and ("indian bank" in text_lower or "indianbank" in text_lower or "idib" in text_lower):
                 return "indianbank"
             if "hdfc bank" in text_lower:
                 return "hdfc"
-            return "hdfc"  # default
-        except Exception:
+
+            warnings.warn("Could not auto-detect bank from PDF header. Defaulting to 'hdfc'. Pass --bank to override explicitly.")
+            return "hdfc"
+        except Exception as e:
+            warnings.warn(f"Error during bank auto-detection ({e}). Defaulting to 'hdfc'. Pass --bank to override explicitly.")
             return "hdfc"
 
     # ── Shared helpers ──────────────────────────────────────────────────
 
     def clean_amount(self, amount_str):
-        """Cleans formatting from amount strings and converts to float/string representation."""
+        """Cleans formatting from amount strings and converts to float representation."""
         if not amount_str:
             return None
-        cleaned = amount_str.replace(",", "").strip()
-        if not cleaned:
+        cleaned = str(amount_str).replace(",", "").strip()
+        if not cleaned or cleaned in ('-', '(', ')'):
             return None
         try:
             return float(cleaned)
@@ -96,379 +265,130 @@ class BankStatementParser:
             return ""
         return f"{val:.2f}"
 
-    # ── Top-level dispatch ───────────────────────────────────────────────
+    def _extract_iob_dates_and_ref(self, block_ys, grouped_lines, profile):
+        """Helper to extract transaction dates, value dates, and reference numbers for IOB blocks."""
+        date_text = ""
+        val_date_text = ""
+        ref_parts = []
+
+        ref_bounds = profile.col_bounds.get('chq_ref')
+
+        for gk in block_ys:
+            line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+            for w in line_words:
+                if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]:
+                    if profile.vdate_pattern:
+                        vm = profile.vdate_pattern.match(w.text)
+                        if vm:
+                            val_date_text = vm.group(1)
+                    if profile.date_pattern.match(w.text) and not date_text:
+                        date_text = w.text
+
+            if ref_bounds:
+                rx0, rx1 = ref_bounds
+                r_words = [w.text for w in line_words if rx0 <= w.x0 < rx1 and w.text != '-']
+                if r_words:
+                    ref_parts.extend(r_words)
+
+        return date_text, val_date_text or date_text, " ".join(ref_parts).strip()
+
+    def _handle_cross_page_continuation(self, raw_txs, valid_ys, date_ys, grouped_lines, profile):
+        """Appends narration overflow at top of page (before first anchor) to previous page's final transaction."""
+        if not raw_txs or not valid_ys:
+            return
+        first_date_y = date_ys[0][0] if date_ys else (valid_ys[-1] + 1)
+        pre_date_ys = [gk for gk in valid_ys if gk < first_date_y]
+        if pre_date_ys:
+            narration_bounds = profile.col_bounds.get('narration')
+            if narration_bounds:
+                nx0, nx1 = narration_bounds
+                pre_parts = []
+                for gk in pre_date_ys:
+                    line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                    n_words = [w.text for w in line_words if nx0 <= w.x0 < nx1]
+                    if n_words:
+                        pre_parts.append(" ".join(n_words))
+                if pre_parts:
+                    raw_txs[-1]['narration'] += " " + " ".join(pre_parts)
+
+    # ── Universal Unified Parsing Engine ─────────────────────────────────
 
     def parse(self):
-        if self.bank == "sbi":
-            print(f"Detected bank: SBI")
-            if HAS_FITZ:
-                try:
-                    return self.parse_sbi_fitz()
-                except Exception as e:
-                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
-            return self.parse_sbi_pdfplumber()
-        elif self.bank == "iob":
-            print(f"Detected bank: Indian Overseas Bank (IOB)")
-            if HAS_FITZ:
-                try:
-                    return self.parse_iob_fitz()
-                except Exception as e:
-                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
-            return self.parse_iob_pdfplumber()
-        elif self.bank == "canara":
-            print(f"Detected bank: Canara Bank")
-            if HAS_FITZ:
-                try:
-                    return self.parse_canara_fitz()
-                except Exception as e:
-                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
-            return self.parse_canara_pdfplumber()
-        elif self.bank == "indianbank":
-            print(f"Detected bank: Indian Bank")
-            if HAS_FITZ:
-                try:
-                    return self.parse_indianbank_fitz()
-                except Exception as e:
-                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
-            return self.parse_indianbank_pdfplumber()
+        profile = BANK_PROFILES.get(self.bank, BANK_PROFILES['hdfc'])
+        print(f"Detected bank: {profile.display_name}")
+
+        if HAS_FITZ:
+            try:
+                return self._parse_with_engine(profile, engine="fitz")
+            except Exception as e:
+                print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
+
+        return self._parse_with_engine(profile, engine="pdfplumber")
+
+    def _extract_words(self, page, engine):
+        """Extracts words from a PDF page and normalizes them into NormalizedWord objects."""
+        words = []
+        if engine == "fitz":
+            raw_words = page.get_text("words")
+            for w in raw_words:
+                words.append(NormalizedWord(w[0], w[1], w[2], w[4]))
         else:
-            print(f"Detected bank: HDFC")
-            if HAS_FITZ:
-                try:
-                    return self.parse_hdfc_fitz()
-                except Exception as e:
-                    print(f"PyMuPDF parsing failed: {e}. Falling back to pdfplumber...")
-            return self.parse_hdfc_pdfplumber()
+            raw_words = page.extract_words()
+            for w in raw_words:
+                words.append(NormalizedWord(w['x0'], w['top'], w['x1'], w['text']))
+        return words
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  HDFC Parsing (existing logic, unchanged)
-    # ═══════════════════════════════════════════════════════════════════
+    def _parse_with_engine(self, profile: BankProfile, engine: str):
+        """
+        Generic, Profile-Driven Bank PDF Parsing Engine.
 
-    def parse_hdfc_fitz(self):
-        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
-        transactions = []
-        current_tx = None
-        date_pattern = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
+        Flow:
+        1. Extract & normalize words via PyMuPDF (fitz) or pdfplumber.
+        2. Filter header padding (page1_min_y vs pageN_min_y) and footer limits (max_y).
+        3. Group words into horizontal lines by Y-coordinate (configurable tolerance).
+        4. Suppress header rows and footer summary blocks using word-boundary keyword triggers.
+        5. Identify date anchors (single-pattern, split 3-word date, or balance-anchored for IOB).
+        6. Segment horizontal lines into discrete transaction blocks between consecutive anchors.
+        7. Support cross-page narration overflow appending to previous page's final transaction across all bank profiles.
+        8. Extract fields (date, val_date, narration, chq_ref, withdrawal, deposit, balance).
+        9. Standardize & validate numerical values, handle dash indicators & currency prefixes.
+        10. Re-order pages and lines if profile specifies non-chronological order (e.g. IOB).
+        """
+        print(f"Opening PDF ({'PyMuPDF' if engine == 'fitz' else 'pdfplumber'}): {self.pdf_path}")
+        raw_txs = []
 
-        col_definitions = [
-            ('date', 30, 65),
-            ('narration', 65, 280),
-            ('chq_ref', 280, 350),
-            ('val_date', 350, 400),
-            ('withdrawal', 400, 480),
-            ('deposit', 480, 560),
-            ('balance', 560, 630),
-        ]
-
-        doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        print(f"Total pages to parse: {total_pages}")
-
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            page_num = page_idx + 1
-
-            if self.verbose or page_num % 50 == 0 or page_num == total_pages:
-                print(f"Processing page {page_num}/{total_pages}...")
-
-            words = page.get_text("words")
-            table_words = [w for w in words if 225 <= w[1] <= 780]
-
-            grouped_lines = {}
-            for w in table_words:
-                y0_val = w[1]
-                found = False
-                for gk in grouped_lines.keys():
-                    if abs(gk - y0_val) < 2.0:
-                        grouped_lines[gk].append(w)
-                        found = True
-                        break
-                if not found:
-                    grouped_lines[y0_val] = [w]
-
-            for gk in sorted(grouped_lines.keys()):
-                line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-                cols = {name: [] for name, _, _ in col_definitions}
-                for w in line_words:
-                    x0 = w[0]
-                    text = w[4]
-                    for name, start, end in col_definitions:
-                        if start <= x0 < end:
-                            cols[name].append(text)
-                            break
-                ld = {name: " ".join(words_list).strip() for name, words_list in cols.items()}
-
-                if ld['date'] == 'Date' or ld['narration'] == 'Narration':
-                    continue
-                if not any(ld.values()):
-                    continue
-
-                is_new_tx = date_pattern.match(ld['date'])
-
-                if is_new_tx:
-                    if current_tx:
-                        transactions.append(current_tx)
-                    current_tx = {
-                        'date': ld['date'],
-                        'narration': ld['narration'],
-                        'chq_ref': ld['chq_ref'],
-                        'val_date': ld['val_date'],
-                        'withdrawal': self.clean_amount(ld['withdrawal']),
-                        'deposit': self.clean_amount(ld['deposit']),
-                        'balance': self.clean_amount(ld['balance']),
-                        'page': page_num,
-                    }
-                else:
-                    if current_tx:
-                        continuation_parts = []
-                        for col_name in ['date', 'narration', 'chq_ref', 'val_date', 'withdrawal', 'deposit', 'balance']:
-                            val = ld[col_name]
-                            if val:
-                                continuation_parts.append(val)
-                        continuation_text = " ".join(continuation_parts).strip()
-                        if continuation_text:
-                            current_tx['narration'] += " " + continuation_text
-
-        if current_tx:
-            transactions.append(current_tx)
-
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
-
-    def parse_hdfc_pdfplumber(self):
-        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
-        transactions = []
-        current_tx = None
-        date_pattern = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
-
-        col_definitions = [
-            ('date', 30, 65),
-            ('narration', 65, 280),
-            ('chq_ref', 280, 350),
-            ('val_date', 350, 400),
-            ('withdrawal', 400, 480),
-            ('deposit', 480, 560),
-            ('balance', 560, 630),
-        ]
-
-        with pdfplumber.open(self.pdf_path) as pdf:
+        if engine == "fitz":
+            doc = fitz.open(self.pdf_path)
+            total_pages = len(doc)
+            get_page = lambda idx: doc[idx]
+            close_doc = lambda: doc.close()
+        else:
+            pdf = pdfplumber.open(self.pdf_path)
             total_pages = len(pdf.pages)
-            print(f"Total pages to parse: {total_pages}")
+            get_page = lambda idx: pdf.pages[idx]
+            close_doc = lambda: pdf.close()
 
+        print(f"Total pages to parse ({profile.display_name}): {total_pages}")
+
+        try:
             for page_idx in range(total_pages):
-                page = pdf.pages[page_idx]
                 page_num = page_idx + 1
-
                 if self.verbose or page_num % 10 == 0 or page_num == total_pages:
                     print(f"Processing page {page_num}/{total_pages}...")
 
-                words = page.extract_words()
-                table_words = [w for w in words if 225 <= w['top'] <= 780]
+                page = get_page(page_idx)
+                words = self._extract_words(page, engine)
 
+                min_y = profile.page1_min_y if page_idx == 0 else profile.pageN_min_y
+                table_words = [w for w in words if min_y <= w.top <= profile.max_y]
+
+                # Group words into horizontal lines by Y-coordinate using profile.line_group_tolerance
                 grouped_lines = {}
                 for w in table_words:
-                    top_val = w['top']
+                    top_val = w.top
                     found = False
                     for gk in grouped_lines.keys():
-                        if abs(gk - top_val) < 2.0:
-                            grouped_lines[gk].append(w)
-                            found = True
-                            break
-                    if not found:
-                        grouped_lines[top_val] = [w]
-
-                for gk in sorted(grouped_lines.keys()):
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                    cols = {name: [] for name, _, _ in col_definitions}
-                    for w in line_words:
-                        x0 = w['x0']
-                        text = w['text']
-                        for name, start, end in col_definitions:
-                            if start <= x0 < end:
-                                cols[name].append(text)
-                                break
-                    ld = {name: " ".join(words_list).strip() for name, words_list in cols.items()}
-
-                    if ld['date'] == 'Date' or ld['narration'] == 'Narration':
-                        continue
-                    if not any(ld.values()):
-                        continue
-
-                    is_new_tx = date_pattern.match(ld['date'])
-
-                    if is_new_tx:
-                        if current_tx:
-                            transactions.append(current_tx)
-                        current_tx = {
-                            'date': ld['date'],
-                            'narration': ld['narration'],
-                            'chq_ref': ld['chq_ref'],
-                            'val_date': ld['val_date'],
-                            'withdrawal': self.clean_amount(ld['withdrawal']),
-                            'deposit': self.clean_amount(ld['deposit']),
-                            'balance': self.clean_amount(ld['balance']),
-                            'page': page_num,
-                        }
-                    else:
-                        if current_tx:
-                            continuation_parts = []
-                            for col_name in ['date', 'narration', 'chq_ref', 'val_date', 'withdrawal', 'deposit', 'balance']:
-                                val = ld[col_name]
-                                if val:
-                                    continuation_parts.append(val)
-                            continuation_text = " ".join(continuation_parts).strip()
-                            if continuation_text:
-                                current_tx['narration'] += " " + continuation_text
-
-            if current_tx:
-                transactions.append(current_tx)
-
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  SBI Parsing
-    # ═══════════════════════════════════════════════════════════════════
-
-    def parse_sbi_fitz(self):
-        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
-        transactions = []
-        date_pattern = re.compile(r'^\d{2}/\d{2}/\d{4}$')
-
-        doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        print(f"Total pages to parse (SBI): {total_pages}")
-
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            page_num = page_idx + 1
-
-            if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                print(f"Processing page {page_num}/{total_pages}...")
-
-            words = page.get_text("words")
-            min_y = 180 if page_idx == 0 else 40
-            table_words = [w for w in words if min_y <= w[1] <= 730]
-
-            grouped_lines = {}
-            for w in table_words:
-                y0_val = w[1]
-                found = False
-                for gk in grouped_lines.keys():
-                    if abs(gk - y0_val) < 2.0:
-                        grouped_lines[gk].append(w)
-                        found = True
-                        break
-                if not found:
-                    grouped_lines[y0_val] = [w]
-
-            sorted_ys = sorted(grouped_lines.keys())
-
-            # Filter out summary/footer lines
-            valid_ys = []
-            for gk in sorted_ys:
-                line_text = " ".join(w[4] for w in sorted(grouped_lines[gk], key=lambda w: w[0]))
-                if any(kw in line_text for kw in [
-                    'Statement Summary', 'Total:', 'Closing Balance',
-                    'Page ', 'This is a computer'
-                ]):
-                    break
-                valid_ys.append(gk)
-
-            date_ys = []
-            for gk in valid_ys:
-                line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-                dt_text = " ".join(w[4] for w in line_words if 20 <= w[0] < 78).strip()
-                if date_pattern.match(dt_text):
-                    date_ys.append((gk, dt_text))
-
-            if not date_ys:
-                continue
-
-            for i, (dy, dt_str) in enumerate(date_ys):
-                block_end = date_ys[i + 1][0] - 10 if i + 1 < len(date_ys) else (valid_ys[-1] + 1)
-                block_ys = [gk for gk in valid_ys if (dy - 10) <= gk < block_end]
-
-                narration_parts = []
-                val_date_text = dt_str
-                chq_ref_parts = []
-                debit_val = None
-                credit_val = None
-                balance_val = None
-
-                for gk in block_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-
-                    if gk == dy:
-                        vd_text = " ".join(w[4] for w in line_words if 78 <= w[0] < 130).strip()
-                        if date_pattern.match(vd_text):
-                            val_date_text = vd_text
-
-                    n_words = [w[4] for w in line_words if 130 <= w[0] < 290]
-                    if n_words:
-                        narration_parts.append(" ".join(n_words))
-
-                    ref_words = [w[4] for w in line_words if 290 <= w[0] < 335 and w[4] != '-']
-                    if ref_words:
-                        chq_ref_parts.extend(ref_words)
-
-                    for w in line_words:
-                        x = w[0]
-                        val_str = w[4].replace(',', '')
-                        if val_str == '-':
-                            continue
-                        try:
-                            fval = float(val_str)
-                        except ValueError:
-                            continue
-                        if 335 <= x < 410:
-                            debit_val = fval
-                        elif 410 <= x < 485:
-                            credit_val = fval
-                        elif 485 <= x < 580:
-                            balance_val = fval
-
-                transactions.append({
-                    'date': dt_str,
-                    'narration': " ".join(narration_parts).strip(),
-                    'chq_ref': " ".join(chq_ref_parts).strip(),
-                    'val_date': val_date_text,
-                    'withdrawal': debit_val,
-                    'deposit': credit_val,
-                    'balance': balance_val,
-                    'page': page_num,
-                })
-
-        doc.close()
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
-
-    def parse_sbi_pdfplumber(self):
-        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
-        transactions = []
-        date_pattern = re.compile(r'^\d{2}/\d{2}/\d{4}$')
-
-        with pdfplumber.open(self.pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"Total pages to parse (SBI): {total_pages}")
-
-            for page_idx in range(total_pages):
-                page = pdf.pages[page_idx]
-                page_num = page_idx + 1
-
-                if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                    print(f"Processing page {page_num}/{total_pages}...")
-
-                words = page.extract_words()
-                min_y = 180 if page_idx == 0 else 40
-                table_words = [w for w in words if min_y <= w['top'] <= 730]
-
-                grouped_lines = {}
-                for w in table_words:
-                    top_val = w['top']
-                    found = False
-                    for gk in grouped_lines.keys():
-                        if abs(gk - top_val) < 2.0:
+                        if abs(gk - top_val) < profile.line_group_tolerance:
                             grouped_lines[gk].append(w)
                             found = True
                             break
@@ -477,809 +397,272 @@ class BankStatementParser:
 
                 sorted_ys = sorted(grouped_lines.keys())
 
+                # Filter out summary/footer lines and column headers with word boundary matching
                 valid_ys = []
                 for gk in sorted_ys:
-                    line_text = " ".join(w['text'] for w in sorted(grouped_lines[gk], key=lambda w: w['x0']))
-                    if any(kw in line_text for kw in [
-                        'Statement Summary', 'Total:', 'Closing Balance',
-                        'Page ', 'This is a computer'
-                    ]):
+                    line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                    line_text = " ".join(w.text for w in line_words)
+
+                    # Stop processing page if footer keyword found
+                    if any(_matches_word_keyword(kw, line_text) for kw in profile.footer_keywords):
                         break
-                    valid_ys.append(gk)
-
-                date_ys = []
-                for gk in valid_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                    dt_text = " ".join(w['text'] for w in line_words if 20 <= w['x0'] < 78).strip()
-                    if date_pattern.match(dt_text):
-                        date_ys.append((gk, dt_text))
-
-                if not date_ys:
-                    continue
-
-                for i, (dy, dt_str) in enumerate(date_ys):
-                    block_end = date_ys[i + 1][0] - 10 if i + 1 < len(date_ys) else (valid_ys[-1] + 1)
-                    block_ys = [gk for gk in valid_ys if (dy - 10) <= gk < block_end]
-
-                    narration_parts = []
-                    val_date_text = dt_str
-                    chq_ref_parts = []
-                    debit_val = None
-                    credit_val = None
-                    balance_val = None
-
-                    for gk in block_ys:
-                        line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-
-                        if gk == dy:
-                            vd_text = " ".join(w['text'] for w in line_words if 78 <= w['x0'] < 130).strip()
-                            if date_pattern.match(vd_text):
-                                val_date_text = vd_text
-
-                        n_words = [w['text'] for w in line_words if 130 <= w['x0'] < 290]
-                        if n_words:
-                            narration_parts.append(" ".join(n_words))
-
-                        ref_words = [w['text'] for w in line_words if 290 <= w['x0'] < 335 and w['text'] != '-']
-                        if ref_words:
-                            chq_ref_parts.extend(ref_words)
-
-                        for w in line_words:
-                            x = w['x0']
-                            val_str = w['text'].replace(',', '')
-                            if val_str == '-':
-                                continue
-                            try:
-                                fval = float(val_str)
-                            except ValueError:
-                                continue
-                            if 335 <= x < 410:
-                                debit_val = fval
-                            elif 410 <= x < 485:
-                                credit_val = fval
-                            elif 485 <= x < 580:
-                                balance_val = fval
-
-                    transactions.append({
-                        'date': dt_str,
-                        'narration': " ".join(narration_parts).strip(),
-                        'chq_ref': " ".join(chq_ref_parts).strip(),
-                        'val_date': val_date_text,
-                        'withdrawal': debit_val,
-                        'deposit': credit_val,
-                        'balance': balance_val,
-                        'page': page_num,
-                    })
-
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
-
-    # ═══════════════════════════════════════════════════════════════════
-    #  IOB Parsing (Indian Overseas Bank)
-    #  Reverse chronological, 2-line blocks, DD-Mon-YY dates
-    # ═══════════════════════════════════════════════════════════════════
-
-    def parse_iob_fitz(self):
-        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
-        raw_txs = []
-        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
-        vdate_pattern = re.compile(r'^\((\d{2}-[A-Z][a-z]{2}-\d{2})\)$')
-
-        doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        print(f"Total pages to parse (IOB): {total_pages}")
-
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            page_num = page_idx + 1
-
-            if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                print(f"Processing page {page_num}/{total_pages}...")
-
-            words = page.get_text("words")
-            min_y = 260 if page_idx == 0 else 30
-            table_words = [w for w in words if min_y <= w[1] <= 790 and not w[4].startswith('Page ')]
-
-            grouped_lines = {}
-            for w in table_words:
-                y0_val = w[1]
-                found = False
-                for gk in grouped_lines.keys():
-                    if abs(gk - y0_val) < 2.0:
-                        grouped_lines[gk].append(w)
-                        found = True
-                        break
-                if not found:
-                    grouped_lines[y0_val] = [w]
-
-            sorted_ys = sorted(grouped_lines.keys())
-
-            # Filter out header and summary/footer lines
-            valid_ys = []
-            for gk in sorted_ys:
-                line_text = " ".join(w[4] for w in sorted(grouped_lines[gk], key=lambda w: w[0]))
-                if any(kw in line_text for kw in [
-                    'STATEMENT OF THE ACCOUNT', 'CUSTOMER DETAILS',
-                    'Particulars', 'Ref No.', 'Debit(Rs)',
-                    'Effective available balance', 'computer generated statement', 'Page '
-                ]):
-                    continue
-                valid_ys.append(gk)
-
-            # Identify transaction lines via Balance column (x >= 510)
-            bal_ys = []
-            for gk in valid_ys:
-                line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-                for w in line_words:
-                    if w[0] >= 510 and w[4] not in ('-', '(', ')'):
-                        try:
-                            fval = float(w[4].replace(',', ''))
-                            bal_ys.append((gk, fval))
-                            break
-                        except ValueError:
-                            pass
-
-            for i, (by, bal_val) in enumerate(bal_ys):
-                next_by = bal_ys[i + 1][0] if i + 1 < len(bal_ys) else None
-                block_start = by - 6
-                block_end = (next_by - 6) if next_by is not None else (by + 15)
-                block_ys = [gk for gk in valid_ys if block_start <= gk < block_end]
-
-                date_text = ""
-                val_date_text = ""
-                narration_parts = []
-                ref_parts = []
-                debit_val = None
-                credit_val = None
-
-                for gk in block_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-
-                    for w in line_words:
-                        if 40 <= w[0] < 90:
-                            vm = vdate_pattern.match(w[4])
-                            if vm:
-                                val_date_text = vm.group(1)
-                            elif date_pattern.match(w[4]) and not date_text:
-                                date_text = w[4]
-
-                    n_words = [w[4] for w in line_words if 90 <= w[0] < 275]
-                    if n_words:
-                        narration_parts.append(" ".join(n_words))
-
-                    r_words = [w[4] for w in line_words if 275 <= w[0] < 340 and w[4] != '-']
-                    if r_words:
-                        ref_parts.extend(r_words)
-
-                    for w in line_words:
-                        x = w[0]
-                        val_str = w[4].replace(',', '')
-                        if val_str in ('-', '(', ')'):
-                            continue
-                        try:
-                            fval = float(val_str)
-                        except ValueError:
-                            continue
-                        if 395 <= x < 455:
-                            debit_val = fval
-                        elif 455 <= x < 510:
-                            credit_val = fval
-
-                raw_txs.append({
-                    'date': date_text,
-                    'narration': " ".join(narration_parts).strip(),
-                    'chq_ref': " ".join(ref_parts).strip(),
-                    'val_date': val_date_text if val_date_text else date_text,
-                    'withdrawal': debit_val,
-                    'deposit': credit_val,
-                    'balance': bal_val,
-                    'page': page_num,
-                })
-
-        doc.close()
-
-        # Restore chronological order (pages N -> 1, items reversed)
-        page_groups = {}
-        for tx in raw_txs:
-            page_groups.setdefault(tx['page'], []).append(tx)
-        result = []
-        for p in sorted(page_groups.keys(), reverse=True):
-            result.extend(reversed(page_groups[p]))
-
-        print(f"Extraction complete. Found {len(result)} raw transactions.")
-        return result
-
-    def parse_iob_pdfplumber(self):
-        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
-        raw_txs = []
-        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
-        vdate_pattern = re.compile(r'^\((\d{2}-[A-Z][a-z]{2}-\d{2})\)$')
-
-        with pdfplumber.open(self.pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"Total pages to parse (IOB): {total_pages}")
-
-            for page_idx in range(total_pages):
-                page = pdf.pages[page_idx]
-                page_num = page_idx + 1
-
-                if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                    print(f"Processing page {page_num}/{total_pages}...")
-
-                words = page.extract_words()
-                min_y = 260 if page_idx == 0 else 30
-                table_words = [w for w in words if min_y <= w['top'] <= 790 and not w['text'].startswith('Page ')]
-
-                grouped_lines = {}
-                for w in table_words:
-                    top_val = w['top']
-                    found = False
-                    for gk in grouped_lines.keys():
-                        if abs(gk - top_val) < 2.0:
-                            grouped_lines[gk].append(w)
-                            found = True
-                            break
-                    if not found:
-                        grouped_lines[top_val] = [w]
-
-                sorted_ys = sorted(grouped_lines.keys())
-
-                valid_ys = []
-                for gk in sorted_ys:
-                    line_text = " ".join(w['text'] for w in sorted(grouped_lines[gk], key=lambda w: w['x0']))
-                    if any(kw in line_text for kw in [
-                        'STATEMENT OF THE ACCOUNT', 'CUSTOMER DETAILS',
-                        'Particulars', 'Ref No.', 'Debit(Rs)',
-                        'Effective available balance', 'computer generated statement', 'Page '
-                    ]):
+                    # Skip header lines
+                    if any(_matches_word_keyword(kw, line_text) for kw in profile.header_keywords):
                         continue
+
                     valid_ys.append(gk)
 
-                bal_ys = []
-                for gk in valid_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                    for w in line_words:
-                        if w['x0'] >= 510 and w['text'] not in ('-', '(', ')'):
-                            try:
-                                fval = float(w['text'].replace(',', ''))
-                                bal_ys.append((gk, fval))
-                                break
-                            except ValueError:
-                                pass
+                # ── Anchor & Block Segmentation ──
 
-                for i, (by, bal_val) in enumerate(bal_ys):
-                    next_by = bal_ys[i + 1][0] if i + 1 < len(bal_ys) else None
-                    block_start = by - 6
-                    block_end = (next_by - 6) if next_by is not None else (by + 15)
-                    block_ys = [gk for gk in valid_ys if block_start <= gk < block_end]
+                if profile.date_type == "single":
+                    date_ys = []
+                    for gk in valid_ys:
+                        line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                        dt_text = " ".join(w.text for w in line_words if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]).strip()
+                        if profile.date_pattern.match(dt_text):
+                            date_ys.append((gk, dt_text))
 
-                    date_text = ""
-                    val_date_text = ""
-                    narration_parts = []
-                    ref_parts = []
-                    debit_val = None
-                    credit_val = None
+                    # Universal cross-page narration overflow check
+                    self._handle_cross_page_continuation(raw_txs, valid_ys, date_ys, grouped_lines, profile)
 
-                    for gk in block_ys:
-                        line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
+                    if not date_ys:
+                        continue
 
-                        for w in line_words:
-                            if 40 <= w['x0'] < 90:
-                                vm = vdate_pattern.match(w['text'])
-                                if vm:
-                                    val_date_text = vm.group(1)
-                                elif date_pattern.match(w['text']) and not date_text:
-                                    date_text = w['text']
+                    # Hoist column bound lookups outside the word iteration loop
+                    val_date_bounds = profile.col_bounds.get('val_date')
+                    narration_bounds = profile.col_bounds.get('narration')
+                    chq_ref_bounds = profile.col_bounds.get('chq_ref')
+                    wx0, wx1 = profile.col_bounds['withdrawal']
+                    dx0, dx1 = profile.col_bounds['deposit']
+                    bx0, bx1 = profile.col_bounds['balance']
 
-                        n_words = [w['text'] for w in line_words if 90 <= w['x0'] < 275]
-                        if n_words:
-                            narration_parts.append(" ".join(n_words))
+                    for i, (dy, dt_str) in enumerate(date_ys):
+                        block_end = date_ys[i + 1][0] if i + 1 < len(date_ys) else (valid_ys[-1] + 1)
+                        block_ys = [gk for gk in valid_ys if dy <= gk < block_end]
 
-                        ref_words = [w['text'] for w in line_words if 275 <= w['x0'] < 340 and w['text'] != '-']
-                        if ref_words:
-                            ref_parts.extend(ref_words)
+                        narration_parts = []
+                        val_date_text = dt_str
+                        chq_ref_parts = []
+                        debit_val = None
+                        credit_val = None
+                        balance_val = None
 
-                        for w in line_words:
-                            x = w['x0']
-                            val_str = w['text'].replace(',', '')
-                            if val_str in ('-', '(', ')'):
-                                continue
-                            try:
-                                fval = float(val_str)
-                            except ValueError:
-                                continue
-                            if 395 <= x < 455:
-                                debit_val = fval
-                            elif 455 <= x < 510:
-                                credit_val = fval
+                        for gk in block_ys:
+                            line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
 
-                    raw_txs.append({
-                        'date': date_text,
-                        'narration': " ".join(narration_parts).strip(),
-                        'chq_ref': " ".join(ref_parts).strip(),
-                        'val_date': val_date_text if val_date_text else date_text,
-                        'withdrawal': debit_val,
-                        'deposit': credit_val,
-                        'balance': bal_val,
-                        'page': page_num,
-                    })
+                            # Value date (if separate column)
+                            if val_date_bounds:
+                                vx0, vx1 = val_date_bounds
+                                vd_text = " ".join(w.text for w in line_words if vx0 <= w.x0 <= vx1).strip()
+                                if profile.date_pattern.match(vd_text):
+                                    val_date_text = vd_text
 
-        # Restore chronological order
-        page_groups = {}
-        for tx in raw_txs:
-            page_groups.setdefault(tx['page'], []).append(tx)
-        result = []
-        for p in sorted(page_groups.keys(), reverse=True):
-            result.extend(reversed(page_groups[p]))
+                            # Narration
+                            if narration_bounds:
+                                nx0, nx1 = narration_bounds
+                                n_words = [w.text for w in line_words if nx0 <= w.x0 < nx1]
+                                if n_words:
+                                    narration_parts.append(" ".join(n_words))
 
-        print(f"Extraction complete. Found {len(result)} raw transactions.")
-        return result
+                            # Chq/Ref
+                            if chq_ref_bounds:
+                                rx0, rx1 = chq_ref_bounds
+                                if rx0 < rx1:
+                                    ref_words = [w.text for w in line_words if rx0 <= w.x0 < rx1 and w.text != '-']
+                                    if ref_words:
+                                        chq_ref_parts.extend(ref_words)
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Canara Bank Parsing (e-Pass Sheet)
-    #  Chronological order, DD-Mon-YY dates, block-based layout
-    # ═══════════════════════════════════════════════════════════════════
-
-    def parse_canara_fitz(self):
-        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
-        transactions = []
-        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
-
-        doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        print(f"Total pages to parse (Canara): {total_pages}")
-
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            page_num = page_idx + 1
-
-            if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                print(f"Processing page {page_num}/{total_pages}...")
-
-            words = page.get_text("words")
-            min_y = 240 if page_idx == 0 else 10
-            table_words = [w for w in words if w[1] >= min_y]
-
-            grouped_lines = {}
-            for w in table_words:
-                y0_val = w[1]
-                found = False
-                for gk in grouped_lines.keys():
-                    if abs(gk - y0_val) < 2.0:
-                        grouped_lines[gk].append(w)
-                        found = True
-                        break
-                if not found:
-                    grouped_lines[y0_val] = [w]
-
-            sorted_ys = sorted(grouped_lines.keys())
-
-            # Filter out summary/footer lines
-            valid_ys = []
-            for gk in sorted_ys:
-                line_text = " ".join(w[4] for w in sorted(grouped_lines[gk], key=lambda w: w[0]))
-                if any(kw in line_text for kw in [
-                    'Total:', 'Opening Balance', 'Closing Balance',
-                    'Dr Count', 'Cr Count', 'UNLESS THE',
-                    'COMPUTER OUTPUT', 'End of Statement'
-                ]):
-                    break
-                valid_ys.append(gk)
-
-            date_ys = []
-            for gk in valid_ys:
-                line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-                date_text = " ".join(w[4] for w in line_words if 30 <= w[0] <= 90).strip()
-                if date_pattern.match(date_text):
-                    date_ys.append((gk, date_text))
-
-            if not date_ys:
-                continue
-
-            for i, (dy, date_text) in enumerate(date_ys):
-                block_end = date_ys[i + 1][0] if i + 1 < len(date_ys) else (valid_ys[-1] + 1)
-                block_ys = [gk for gk in valid_ys if dy <= gk < block_end]
-
-                narration_parts = []
-                debit_val = None
-                credit_val = None
-                balance_val = None
-
-                for gk in block_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-
-                    n_words = [w[4] for w in line_words if 90 <= w[0] < 310]
-                    if n_words:
-                        narration_parts.append(" ".join(n_words))
-
-                    for w in line_words:
-                        x = w[0]
-                        val_str = w[4].replace(',', '')
-                        try:
-                            fval = float(val_str)
-                        except ValueError:
-                            continue
-                        if 310 <= x < 424:
-                            debit_val = fval
-                        elif 424 <= x < 515:
-                            credit_val = fval
-                        elif x >= 515:
-                            balance_val = fval
-
-                transactions.append({
-                    'date': date_text,
-                    'narration': " ".join(narration_parts).strip(),
-                    'chq_ref': '',
-                    'val_date': date_text,
-                    'withdrawal': debit_val,
-                    'deposit': credit_val,
-                    'balance': balance_val,
-                    'page': page_num,
-                })
-
-        doc.close()
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
-
-    def parse_canara_pdfplumber(self):
-        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
-        transactions = []
-        date_pattern = re.compile(r'^\d{2}-[A-Z][a-z]{2}-\d{2}$')
-
-        with pdfplumber.open(self.pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"Total pages to parse (Canara): {total_pages}")
-
-            for page_idx in range(total_pages):
-                page = pdf.pages[page_idx]
-                page_num = page_idx + 1
-
-                if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                    print(f"Processing page {page_num}/{total_pages}...")
-
-                words = page.extract_words()
-                # Filter to table region
-                table_words = [w for w in words if w['top'] >= 230]
-
-                # Group by y-coordinate
-                grouped_lines = {}
-                for w in table_words:
-                    top_val = w['top']
-                    found = False
-                    for gk in grouped_lines.keys():
-                        if abs(gk - top_val) < 2.0:
-                            grouped_lines[gk].append(w)
-                            found = True
-                            break
-                    if not found:
-                        grouped_lines[top_val] = [w]
-
-                sorted_ys = sorted(grouped_lines.keys())
-
-                # Find date lines
-                date_ys = []
-                for gk in sorted_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                    # Date is at x 30-80
-                    date_text = " ".join(w['text'] for w in line_words if 30 <= w['x0'] <= 80).strip()
-                    if date_pattern.match(date_text):
-                        date_ys.append(gk)
-
-                if not date_ys:
-                    continue  # summary/footer page
-
-                # For each date, collect narration and amounts
-                for i, dy in enumerate(date_ys):
-                    block_end = date_ys[i + 1] if i + 1 < len(date_ys) else (sorted_ys[-1] + 1)
-
-                    # Collect all lines between this date and the next
-                    block_ys = [gk for gk in sorted_ys if dy <= gk < block_end]
-
-                    # Date text from the date line
-                    date_line = sorted(grouped_lines[dy], key=lambda w: w['x0'])
-                    date_text = " ".join(w['text'] for w in date_line if 30 <= w['x0'] <= 80).strip()
-
-                    narration_parts = []
-                    debit_val = None
-                    credit_val = None
-                    balance_val = None
-
-                    for gk in block_ys:
-                        line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                        line_text = " ".join(w['text'] for w in line_words).strip()
-
-                        # Skip header rows
-                        if line_text in ('Txn Date', 'Txn Description', 'Debit', 'Credit', 'Balance'):
-                            continue
-                        if line_text.startswith('OPENING_BALANCE') or \
-                           any(kw in line_text for kw in ['Total:', 'Opening Balance', 'Closing Balance',
-                                                           'Dr Count', 'Cr Count', 'Dr amount', 'Cr amount',
-                                                           'UNLESS THE', 'COMPUTER OUTPUT', 'End of Statement']):
-                            continue
-
-                        # Check if this is an amount line (has values at x >= 310)
-                        amt_words = [w for w in line_words if w['x0'] >= 310]
-                        if amt_words:
-                            for w in amt_words:
-                                x = w['x0']
-                                try:
-                                    fval = float(w['text'].replace(',', ''))
-                                except ValueError:
+                            # Amounts: withdrawal, deposit, balance
+                            for w in line_words:
+                                val = self.clean_amount(w.text)
+                                if val is None:
                                     continue
-                                if 320 <= x < 424:
-                                    debit_val = fval
-                                elif 424 <= x < 515:
-                                    credit_val = fval
-                                elif x >= 515:
-                                    balance_val = fval
-                        else:
-                            # Narration line
-                            n_words = [w['text'] for w in line_words if 100 <= w['x0'] < 160]
-                            if n_words:
-                                narration_parts.append(" ".join(n_words).strip())
 
-                    if date_text:
-                        transactions.append({
-                            'date': date_text,
-                            'narration': " ".join(narration_parts).strip(),
-                            'chq_ref': '',
-                            'val_date': date_text,
-                            'withdrawal': debit_val,
-                            'deposit': credit_val,
-                            'balance': balance_val,
-                            'page': page_num,
-                        })
+                                if wx0 <= w.x0 < wx1:
+                                    debit_val = val
+                                elif dx0 <= w.x0 < dx1:
+                                    credit_val = val
+                                elif bx0 <= w.x0 <= bx1:
+                                    balance_val = val
 
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
+                        if dt_str and balance_val is not None:
+                            raw_txs.append({
+                                'date': dt_str,
+                                'narration': " ".join(narration_parts).strip(),
+                                'chq_ref': " ".join(chq_ref_parts).strip(),
+                                'val_date': val_date_text,
+                                'withdrawal': debit_val,
+                                'deposit': credit_val,
+                                'balance': balance_val,
+                                'page': page_num,
+                            })
 
-    # ═══════════════════════════════════════════════════════════════════
-    #  Indian Bank Parsing
-    #  Chronological order, DD-Mon-YYYY dates, INR-prefixed amounts
-    # ═══════════════════════════════════════════════════════════════════
+                elif profile.date_type == "split_3":
+                    date_ys = []
+                    for gk in valid_ys:
+                        line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                        date_words = [w for w in line_words if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]]
+                        if len(date_words) >= 3:
+                            day_text = date_words[0].text
+                            month_text = date_words[1].text
+                            year_text = date_words[2].text
+                            if (profile.date_pattern.match(day_text) and
+                                MONTH_PATTERN.match(month_text) and
+                                YEAR_PATTERN.match(year_text)):
+                                date_ys.append((gk, f"{day_text} {month_text} {year_text}"))
 
-    def parse_indianbank_fitz(self):
-        print(f"Opening PDF (PyMuPDF): {self.pdf_path}")
-        transactions = []
-        # Indian Bank dates: "02 May 2026" as 3 separate words
-        date_pattern = re.compile(r'^\d{2}$')
-        month_pattern = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$')
-        year_pattern = re.compile(r'^\d{4}$')
+                    # Universal cross-page narration overflow check
+                    self._handle_cross_page_continuation(raw_txs, valid_ys, date_ys, grouped_lines, profile)
 
-        doc = fitz.open(self.pdf_path)
-        total_pages = len(doc)
-        print(f"Total pages to parse (Indian Bank): {total_pages}")
+                    if not date_ys:
+                        continue
 
-        for page_idx in range(total_pages):
-            page = doc[page_idx]
-            page_num = page_idx + 1
+                    # Hoist column bound lookups
+                    narration_bounds = profile.col_bounds.get('narration')
+                    wx0, wx1 = profile.col_bounds['withdrawal']
+                    dx0, dx1 = profile.col_bounds['deposit']
+                    bx0, bx1 = profile.col_bounds['balance']
 
-            if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                print(f"Processing page {page_num}/{total_pages}...")
+                    for i, (dy, date_text) in enumerate(date_ys):
+                        block_end = date_ys[i + 1][0] if i + 1 < len(date_ys) else (valid_ys[-1] + 1)
+                        block_ys = [gk for gk in valid_ys if dy <= gk < block_end]
 
-            words = page.get_text("words")
-            # Indian Bank table region: y 65-780 (excludes page headers & footers)
-            table_words = [w for w in words if 65 <= w[1] <= 780]
+                        narration_parts = []
+                        debit_val = None
+                        credit_val = None
+                        balance_val = None
 
-            # Group by y-coordinate
-            grouped_lines = {}
-            for w in table_words:
-                y0_val = w[1]
-                found = False
-                for gk in grouped_lines.keys():
-                    if abs(gk - y0_val) < 2.0:
-                        grouped_lines[gk].append(w)
-                        found = True
-                        break
-                if not found:
-                    grouped_lines[y0_val] = [w]
+                        for gk in block_ys:
+                            line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
 
-            sorted_ys = sorted(grouped_lines.keys())
+                            # Narration
+                            if narration_bounds:
+                                nx0, nx1 = narration_bounds
+                                n_words = [w.text for w in line_words if nx0 <= w.x0 <= nx1]
+                                if n_words:
+                                    narration_parts.append(" ".join(n_words))
 
-            # Find date lines (3 consecutive words: DD MMM YYYY)
-            date_ys = []
-            for gk in sorted_ys:
-                line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
-                # Check for date pattern at x=71.5-123.5
-                date_words = [w for w in line_words if 71 <= w[0] <= 124]
-                if len(date_words) >= 3:
-                    day_text = date_words[0][4]
-                    month_text = date_words[1][4]
-                    year_text = date_words[2][4]
-                    if (date_pattern.match(day_text) and 
-                        month_pattern.match(month_text) and 
-                        year_pattern.match(year_text)):
-                        date_ys.append((gk, f"{day_text} {month_text} {year_text}"))
+                            # Check configurable dash indicators if configured
+                            debit_indicator = False
+                            if profile.debit_dash_x_range:
+                                x_min, x_max = profile.debit_dash_x_range
+                                debit_indicator = any(x_min <= w.x0 <= x_max and w.text == '-' for w in line_words)
 
-            if not date_ys:
-                continue  # skip summary/header pages
+                            credit_indicator = False
+                            if profile.credit_dash_x_range:
+                                x_min, x_max = profile.credit_dash_x_range
+                                credit_indicator = any(x_min <= w.x0 <= x_max and w.text == '-' for w in line_words)
 
-            # Process each transaction
-            for i, (dy, date_text) in enumerate(date_ys):
-                # Determine block boundaries
-                block_end = date_ys[i + 1][0] if i + 1 < len(date_ys) else (sorted_ys[-1] + 1)
-                block_ys = [gk for gk in sorted_ys if dy <= gk < block_end]
+                            if not debit_indicator:
+                                d_words = [w for w in line_words if wx0 <= w.x0 <= wx1 and w.text != profile.currency_prefix]
+                                if d_words:
+                                    debit_val = self.clean_amount(d_words[0].text)
 
-                # Collect all words in this transaction block
-                narration_parts = []
-                debit_val = None
-                credit_val = None
-                balance_val = None
+                            if not credit_indicator:
+                                c_words = [w for w in line_words if dx0 <= w.x0 <= dx1 and w.text != profile.currency_prefix]
+                                if c_words:
+                                    credit_val = self.clean_amount(c_words[0].text)
 
-                for gk in block_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w[0])
+                            b_words = [w for w in line_words if bx0 <= w.x0 <= bx1 and w.text != profile.currency_prefix]
+                            if b_words:
+                                balance_val = self.clean_amount(b_words[0].text)
 
-                    # Extract narration (x=145-260)
-                    n_words = [w[4] for w in line_words if 145 <= w[0] <= 260]
-                    if n_words:
-                        narration_parts.append(" ".join(n_words))
+                        if date_text and balance_val is not None:
+                            raw_txs.append({
+                                'date': date_text,
+                                'narration': " ".join(narration_parts).strip(),
+                                'chq_ref': '',
+                                'val_date': date_text,
+                                'withdrawal': debit_val,
+                                'deposit': credit_val,
+                                'balance': balance_val,
+                                'page': page_num,
+                            })
 
-                    # Check for debit indicator at x=306 (means credit is empty)
-                    debit_indicator = [w for w in line_words if 305 <= w[0] <= 308 and w[4] == '-']
-                    # Check for credit indicator at x=401 (means debit is empty)
-                    credit_indicator = [w for w in line_words if 400 <= w[0] <= 403 and w[4] == '-']
+                elif profile.date_type == "iob":
+                    bal_ys = []
+                    bal_bounds = profile.col_bounds.get('balance')
+                    if not bal_bounds:
+                        raise ValueError(f"Bank profile '{profile.name}' is missing required 'balance' column bounds")
+                    bal_x0 = bal_bounds[0]
 
-                    # Extract debit amount (x=283-330) - only if no debit indicator
-                    if not debit_indicator:
-                        debit_words = [w for w in line_words if 283 <= w[0] <= 330 and w[4] != 'INR']
-                        if debit_words:
-                            try:
-                                debit_val = float(debit_words[0][4].replace(',', ''))
-                            except ValueError:
-                                pass
+                    for gk in valid_ys:
+                        line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                        for w in line_words:
+                            if w.x0 >= bal_x0 and w.text not in ('-', '(', ')'):
+                                val = self.clean_amount(w.text)
+                                if val is not None:
+                                    bal_ys.append((gk, val))
+                                    break
 
-                    # Extract credit amount (x=378-425) - only if no credit indicator
-                    if not credit_indicator:
-                        credit_words = [w for w in line_words if 378 <= w[0] <= 425 and w[4] != 'INR']
-                        if credit_words:
-                            try:
-                                credit_val = float(credit_words[0][4].replace(',', ''))
-                            except ValueError:
-                                pass
+                    # Universal cross-page narration overflow check for IOB
+                    anchor_date_ys = [(by, "") for by, _ in bal_ys]
+                    if profile.chronological:
+                        self._handle_cross_page_continuation(raw_txs, valid_ys, anchor_date_ys, grouped_lines, profile)
 
-                    # Extract balance (x=470-525)
-                    balance_words = [w for w in line_words if 470 <= w[0] <= 525 and w[4] != 'INR']
-                    if balance_words:
-                        try:
-                            balance_val = float(balance_words[0][4].replace(',', ''))
-                        except ValueError:
-                            pass
+                    narration_bounds = profile.col_bounds.get('narration')
+                    wx0, wx1 = profile.col_bounds['withdrawal']
+                    dx0, dx1 = profile.col_bounds['deposit']
 
-                if date_text and balance_val is not None:
-                    transactions.append({
-                        'date': date_text,
-                        'narration': " ".join(narration_parts).strip(),
-                        'chq_ref': '',
-                        'val_date': date_text,
-                        'withdrawal': debit_val,
-                        'deposit': credit_val,
-                        'balance': balance_val,
-                        'page': page_num,
-                    })
+                    for i, (by, bal_val) in enumerate(bal_ys):
+                        next_by = bal_ys[i + 1][0] if i + 1 < len(bal_ys) else None
+                        block_start = by - profile.iob_block_offset_before
+                        block_end = (next_by - profile.iob_block_offset_before) if next_by is not None else (by + profile.iob_block_offset_after)
+                        block_ys = [gk for gk in valid_ys if block_start <= gk < block_end]
 
-        doc.close()
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
+                        date_text, val_date_text, ref_text = self._extract_iob_dates_and_ref(block_ys, grouped_lines, profile)
+                        narration_parts = []
+                        debit_val = None
+                        credit_val = None
 
-    def parse_indianbank_pdfplumber(self):
-        print(f"Opening PDF (pdfplumber): {self.pdf_path}")
-        transactions = []
-        date_pattern = re.compile(r'^\d{2}$')
-        month_pattern = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$')
-        year_pattern = re.compile(r'^\d{4}$')
+                        for gk in block_ys:
+                            line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
 
-        with pdfplumber.open(self.pdf_path) as pdf:
-            total_pages = len(pdf.pages)
-            print(f"Total pages to parse (Indian Bank): {total_pages}")
+                            if narration_bounds:
+                                nx0, nx1 = narration_bounds
+                                n_words = [w.text for w in line_words if nx0 <= w.x0 < nx1]
+                                if n_words:
+                                    narration_parts.append(" ".join(n_words))
 
-            for page_idx in range(total_pages):
-                page = pdf.pages[page_idx]
-                page_num = page_idx + 1
+                            for w in line_words:
+                                val = self.clean_amount(w.text)
+                                if val is None:
+                                    continue
+                                if wx0 <= w.x0 < wx1:
+                                    debit_val = val
+                                elif dx0 <= w.x0 < dx1:
+                                    credit_val = val
 
-                if self.verbose or page_num % 10 == 0 or page_num == total_pages:
-                    print(f"Processing page {page_num}/{total_pages}...")
+                        if date_text and bal_val is not None:
+                            raw_txs.append({
+                                'date': date_text,
+                                'narration': " ".join(narration_parts).strip(),
+                                'chq_ref': ref_text,
+                                'val_date': val_date_text,
+                                'withdrawal': debit_val,
+                                'deposit': credit_val,
+                                'balance': bal_val,
+                                'page': page_num,
+                            })
 
-                words = page.extract_words()
-                # Indian Bank table region: y 65-780
-                table_words = [w for w in words if 65 <= w['top'] <= 780]
+        finally:
+            close_doc()
 
-                # Group by y-coordinate
-                grouped_lines = {}
-                for w in table_words:
-                    top_val = w['top']
-                    found = False
-                    for gk in grouped_lines.keys():
-                        if abs(gk - top_val) < 2.0:
-                            grouped_lines[gk].append(w)
-                            found = True
-                            break
-                    if not found:
-                        grouped_lines[top_val] = [w]
+        # Handle chronological order adjustment if reverse (e.g. IOB)
+        if not profile.chronological:
+            page_groups = {}
+            for tx in raw_txs:
+                page_groups.setdefault(tx['page'], []).append(tx)
+            result = []
+            for p in sorted(page_groups.keys(), reverse=True):
+                result.extend(reversed(page_groups[p]))
+            raw_txs = result
 
-                sorted_ys = sorted(grouped_lines.keys())
-
-                # Find date lines
-                date_ys = []
-                for gk in sorted_ys:
-                    line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-                    date_words = [w for w in line_words if 71 <= w['x0'] <= 124]
-                    if len(date_words) >= 3:
-                        day_text = date_words[0]['text']
-                        month_text = date_words[1]['text']
-                        year_text = date_words[2]['text']
-                        if (date_pattern.match(day_text) and 
-                            month_pattern.match(month_text) and 
-                            year_pattern.match(year_text)):
-                            date_ys.append((gk, f"{day_text} {month_text} {year_text}"))
-
-                if not date_ys:
-                    continue
-
-                # Process each transaction
-                for i, (dy, date_text) in enumerate(date_ys):
-                    block_end = date_ys[i + 1][0] if i + 1 < len(date_ys) else (sorted_ys[-1] + 1)
-                    block_ys = [gk for gk in sorted_ys if dy <= gk < block_end]
-
-                    narration_parts = []
-                    debit_val = None
-                    credit_val = None
-                    balance_val = None
-
-                    for gk in block_ys:
-                        line_words = sorted(grouped_lines[gk], key=lambda w: w['x0'])
-
-                        # Extract narration (x=145-260)
-                        n_words = [w['text'] for w in line_words if 145 <= w['x0'] <= 260]
-                        if n_words:
-                            narration_parts.append(" ".join(n_words))
-
-                        # Check for debit/credit indicators
-                        debit_indicator = [w for w in line_words if 305 <= w['x0'] <= 308 and w['text'] == '-']
-                        credit_indicator = [w for w in line_words if 400 <= w['x0'] <= 403 and w['text'] == '-']
-
-                        # Extract debit amount (x=283-330)
-                        if not debit_indicator:
-                            debit_words = [w for w in line_words if 283 <= w['x0'] <= 330 and w['text'] != 'INR']
-                            if debit_words:
-                                try:
-                                    debit_val = float(debit_words[0]['text'].replace(',', ''))
-                                except ValueError:
-                                    pass
-
-                        # Extract credit amount (x=378-425)
-                        if not credit_indicator:
-                            credit_words = [w for w in line_words if 378 <= w['x0'] <= 425 and w['text'] != 'INR']
-                            if credit_words:
-                                try:
-                                    credit_val = float(credit_words[0]['text'].replace(',', ''))
-                                except ValueError:
-                                    pass
-
-                        # Extract balance (x=470-525)
-                        balance_words = [w for w in line_words if 470 <= w['x0'] <= 525 and w['text'] != 'INR']
-                        if balance_words:
-                            try:
-                                balance_val = float(balance_words[0]['text'].replace(',', ''))
-                            except ValueError:
-                                pass
-
-                    if date_text and balance_val is not None:
-                        transactions.append({
-                            'date': date_text,
-                            'narration': " ".join(narration_parts).strip(),
-                            'chq_ref': '',
-                            'val_date': date_text,
-                            'withdrawal': debit_val,
-                            'deposit': credit_val,
-                            'balance': balance_val,
-                            'page': page_num,
-                        })
-
-        print(f"Extraction complete. Found {len(transactions)} raw transactions.")
-        return transactions
+        print(f"Extraction complete. Found {len(raw_txs)} raw transactions.")
+        return raw_txs
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Post-processing & output (shared by both banks)
+    #  Post-processing & output (shared by all banks)
     # ═══════════════════════════════════════════════════════════════════
 
     def categorize(self, narration):
@@ -1447,6 +830,10 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="Enable verbose log printing")
 
     args = parser.parse_args()
+
+    if not HAS_FITZ and not HAS_PDFPLUMBER:
+        print("Error: Neither 'pymupdf' nor 'pdfplumber' is installed. Please install at least one (e.g. 'pip install pymupdf').", file=sys.stderr)
+        sys.exit(1)
 
     pdf_base = os.path.splitext(args.pdf_path)[0]
     csv_path = args.csv or f"{pdf_base}_parsed.csv"
