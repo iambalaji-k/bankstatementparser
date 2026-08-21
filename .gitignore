@@ -23,13 +23,9 @@ output/
 .idea/
 
 
-# Added by cargo
-
-/target
-
-
 # Command Code
 .commandcode/
 
 # pdf
 *.pdf
+pdf/

@@ -1,177 +1,126 @@
 # Multi-Bank Statement PDF Parser
 
-A high-performance, profile-driven engine to convert **HDFC**, **SBI**, **Indian Overseas Bank (IOB)**, **Canara Bank**, and **Indian Bank** PDF statements into clean, structured **CSV** and **Excel (.xlsx)** formats. 
+Convert bank statement PDFs into clean, structured **CSV** and **Excel (.xlsx)** files using coordinate-based layout parsing.
 
-Built with a declarative `BankProfile` architecture, it handles multi-line narrations, cross-page overflow, reverse-chronological ordering, and mixed withdrawal/deposit alignment with **100% mathematical consistency**.
+Supports statements from five Indian banks:
 
----
+| Bank | Profile Key | Date Format | Notes |
+| :--- | :---: | :--- | :--- |
+| HDFC Bank | `hdfc` | `DD/MM/YY(YY)` | Default fallback profile |
+| State Bank of India | `sbi` | `DD/MM/YYYY` | Separate value-date column |
+| Indian Overseas Bank | `iob` | `DD-Mon-YY` | Reverse-chronological output, auto re-sorted |
+| Canara Bank | `canara` | `DD-Mon-YY` | No chq/ref or value-date columns |
+| Indian Bank | `indianbank` | `DD Mon YYYY` | Day/month/year split across three words |
 
-## 🌟 Key Features
+## How It Works
 
-- **Unified Profile-Driven Engine**: Powered by `@dataclass BankProfile` definitions that encapsulate layout coordinates, date patterns, column bounds, and keyword rules.
-- **Coordinate-Based Layout Extraction**: Uses precise bounding boxes (`x` coordinates) to align withdrawals, deposits, and balances accurately—eliminating column shifting.
-- **Cross-Page Continuation**: Automatically detects narration text wrapping across page margins and appends top overflow to previous transactions.
-- **Mathematical Integrity Validation**: Validates every single row against the accounting equation:
-  $$\text{Previous Balance} - \text{Withdrawal} + \text{Deposit} = \text{Closing Balance}$$
-  Outputs an automated validation report with zero-discrepancy guarantees.
-- **Automatic Bank Detection**: Inspects page 1 header text to auto-identify the bank layout without manual configuration.
-- **Auto-Categorization**: Dynamically classifies transactions into 16 categories (Salary, UPI, IMPS, NEFT, RTGS, Card, ATM, Investments, Loan EMI, Insurance, etc.).
-- **Dual Export Formats**: Generates UTF-8 CSV and professionally styled Excel `.xlsx` workbooks (navy blue headers, right-aligned currency cells, `#,##0.00` number formatting, dynamic column widths).
+The parser extracts every word from the PDF along with its x/y coordinates (via **PyMuPDF**, falling back to **pdfplumber**), then:
 
----
+1. Filters out page headers/footers using per-bank y-coordinate cutoffs.
+2. Groups words into horizontal lines by y-tolerance.
+3. Drops footer/header keyword lines (statement summaries, column titles).
+4. Segments lines into transactions between date anchors.
+5. Appends narration text that overflows across page breaks to the previous transaction.
+6. Validates every row against the accounting equation:
 
-## 📦 Installation
-
-### Prerequisites
-- Python 3.8+
-- PyMuPDF (`fitz`), `pdfplumber` (optional fallback backend), and `openpyxl` (for Excel export)
-
-### Step-by-Step Setup
-1. Clone or download this repository:
-   ```bash
-   git clone https://github.com/your-repo/bankstatementparser.git
-   cd bankstatementparser
    ```
-2. Create and activate a virtual environment:
-   ```bash
-   python -m venv venv
-   # On Windows:
-   venv\Scripts\activate
-   # On Linux / macOS:
-   source venv/bin/activate
-   ```
-3. Install required dependencies:
-   ```bash
-   pip install pymupdf pdfplumber openpyxl
+   previous balance - withdrawal + deposit == balance   (tolerance 0.02)
    ```
 
----
+7. Auto-categorizes each transaction (UPI, IMPS, NEFT, RTGS, ATM, Salary, Loan EMI, etc.) and writes CSV + styled XLSX output.
 
-## 🚀 CLI Usage & Arguments
+Because bank-specific behavior is entirely data-driven by declarative `BankProfile` definitions (`BANK_PROFILES` in `parser.py`), adding a new bank requires no changes to core parsing code.
 
-### Basic Execution
-Pass any statement PDF directly to `parser.py`:
+## Installation
+
+Requires Python 3.8+.
+
 ```bash
-python parser.py "HDFC.pdf"
+pip install -r requirements.txt
 ```
-*The script auto-detects the bank and outputs `HDFC_parsed.csv` and `HDFC_parsed.xlsx` in the current directory.*
 
----
+> **Note:** `pdf_unlock.py` additionally requires `pypdf`, which is *not* in `requirements.txt`. Install it separately if you need to unlock encrypted PDFs:
+>
+> ```bash
+> pip install pypdf
+> ```
 
-### Command-Line Arguments Reference
+## Usage
 
-| Argument | Type | Required | Default | Description |
-| :--- | :---: | :---: | :--- | :--- |
-| `pdf_path` | Positional | **Yes** | N/A | Path to the bank statement PDF file to parse. |
-| `--bank` | Option | No | `auto` | Manually specify the bank profile. Choices: `hdfc`, `sbi`, `iob`, `canara`, `indianbank`. |
-| `--csv` | Option | No | `<pdf>_parsed.csv` | Custom output filepath for the CSV file. |
-| `--xlsx` | Option | No | `<pdf>_parsed.xlsx` | Custom output filepath for the Excel workbook. |
-| `--verbose` | Flag | No | `False` | Enable verbose progress logs per page. |
-| `-h`, `--help` | Flag | No | N/A | Show help message and exit. |
+### 1. Parse a statement
 
----
-
-### Usage Examples
-
-#### 1. Auto-Detect and Export (Default)
 ```bash
-python parser.py SBI.pdf
+python parser.py pdf/HDFC.pdf
 ```
 
-#### 2. Manually Specify Bank Profile
+Auto-detects the bank from page-1 header text and writes `HDFC_parsed.csv` / `HDFC_parsed.xlsx` beside the input file.
+
 ```bash
-python parser.py my_statement.pdf --bank iob
+# Override auto-detection
+python parser.py stmt.pdf --bank iob
+
+# Custom output paths
+python parser.py Canara.pdf --csv out/july.csv --xlsx out/july.xlsx
+
+# Per-page progress logs
+python parser.py pdf/SBI.pdf --verbose
 ```
 
-#### 3. Custom Output Filepaths
+| Argument | Required | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `pdf_path` | Yes | — | Path to the statement PDF |
+| `--bank` | No | auto-detected | One of `hdfc`, `sbi`, `iob`, `canara`, `indianbank` |
+| `--csv` | No | `<pdf>_parsed.csv` | Custom CSV output path |
+| `--xlsx` | No | `<pdf>_parsed.xlsx` | Custom Excel output path |
+| `--verbose` | No | off | Log progress for every page |
+
+### 2. Unlock an encrypted PDF (optional)
+
+Bank statements are often password-protected. Strip the password first, then parse the unlocked copy:
+
 ```bash
-python parser.py Canara.pdf --csv output/canara_july.csv --xlsx output/canara_july.xlsx
+python pdf_unlock.py encrypted.pdf          # prompts for password
+python pdf_unlock.py encrypted.pdf -p secret123
+python pdf_unlock.py encrypted.pdf -o plain.pdf
+
+python parser.py encrypted_unlocked.pdf
 ```
 
-#### 4. Enable Verbose Logging
-```bash
-python parser.py HDFC.pdf --verbose
-```
+### Output Columns
 
----
+Both formats share the same schema:
 
-## 📊 Supported Bank Profiles
+`Date, Narration, Chq/Ref No, Value Date, Withdrawal, Deposit, Balance, Category, Page`
 
-| Bank Profile | Key | Date Format | Alignment Strategy | Order |
-| :--- | :---: | :---: | :--- | :---: |
-| **HDFC Bank** | `hdfc` | `DD/MM/YYYY` | Coordinate bounds + cross-page continuation | Chronological |
-| **State Bank of India** | `sbi` | `DD/MM/YYYY` | Left-margin single date anchor | Chronological |
-| **Indian Overseas Bank** | `iob` | `DD-Mon-YY` | Balance-anchored float + `(DD-Mon-YY)` | Reverse-Chronological (Auto-sorted) |
-| **Canara Bank** | `canara` | `DD-Mon-YY` | Extended `max_y=840` boundary slicing | Chronological |
-| **Indian Bank** | `indianbank` | `DD Mon YYYY` | 3-token split date + dash indicator ranges | Chronological |
+## Adding a New Bank
 
----
+Three touchpoints in `parser.py`, none inside the parsing engine:
 
-## 🛠️ Adding a New Bank
+1. Add a `BankProfile` entry to `BANK_PROFILES` (column x-bounds in PDF points, date regex, y-cutoffs, footer/header keywords).
+2. Add a match rule to `detect_bank()` (page-1 text matching).
+3. Add the key to argparse `--bank` choices.
 
-Adding support for a new bank requires **no changes to core parsing code**. Simply append a `BankProfile` dataclass definition to `BANK_PROFILES` in `parser.py`:
+## Troubleshooting
 
-```python
-'axis': BankProfile(
-    name='axis',
-    display_name='Axis Bank',
-    date_pattern=re.compile(r'^\d{2}-\d{2}-\d{4}$'),
-    date_x_range=(25.0, 75.0),
-    col_bounds={
-        'date': (25.0, 75.0),
-        'narration': (75.0, 290.0),
-        'chq_ref': (290.0, 350.0),
-        'val_date': None,
-        'withdrawal': (350.0, 430.0),
-        'deposit': (430.0, 510.0),
-        'balance': (510.0, 600.0),
-    },
-    page1_min_y=200.0,
-    pageN_min_y=40.0,
-    footer_keywords=['Total', 'CLOSING BALANCE', 'Page '],
-    header_keywords=['Tran Date', 'Particulars', 'Amount']
-)
-```
+- **Math Validation warnings** usually mean wrong `col_bounds` or a missed footer keyword — not bad arithmetic. Check the "Detected bank:" line first; unrecognized PDFs silently fall back to the HDFC profile (warning only), which produces mass discrepancies on other banks.
+- **Encrypted PDF errors**: run `pdf_unlock.py` before parsing.
+- **Excel export skipped**: install `openpyxl`.
 
----
+## Verification
 
-## 🏷️ Transaction Categories
+No test suite — the regression check is running every sample PDF in `pdf/` and confirming:
 
-| Category | Keywords / Triggers |
-| :--- | :--- |
-| **Salary** | `salary`, `payroll`, `betterplace` |
-| **Foreign Exchange** | `foreign`, `usd`, `eur`, `inw`, `remittance`, `forex` |
-| **UPI** | `upi-` |
-| **IMPS** | `imps-` |
-| **NEFT** | `neft-` |
-| **RTGS** | `rtgs-` |
-| **ATM Withdrawal** | `atm-`, `atm wdl` |
-| **Card Payment** | `card-`, `pos-`, `pos wdl` |
-| **Cheque** | `chq-`, `cheque`, `clg-` |
-| **Interest Income** | `interest credit`, `int.coll`, `interest paid` |
-| **Refund/Cashback** | `refund`, `cashback` |
-| **Bank Charges** | `charge`, `fee`, `gst-`, `tax`, `annual maint` |
-| **Sweep/MOD** | `sweep`, `autosweep`, `mod ` |
-| **Investment** | `mutual fund`, `zerodha`, `groww`, `indmoney`, `icici direct` |
-| **Loan EMI** | `loan`, `emi-` |
-| **Insurance** | `insurance`, `lic ` |
+1. Transaction counts match baseline: HDFC 1601, SBI 167, IOB 693, Canara 521, Indian Bank 30.
+2. Output ends with `Math Validation: SUCCESS` (zero discrepancies).
 
----
+Validate across all five samples before considering parser changes done — a fix that works on one bank often breaks another.
 
-## ⚡ Performance & Benchmarks
+## License
 
-The Python engine leverages PyMuPDF's low-level C bindings (`fitz`) for near-instant execution:
+Released under the [Unlicense](LICENSE) — free and unencumbered software dedicated to the public domain. Copy, modify, publish, use, compile, sell, or distribute it for any purpose, commercial or non-commercial, with no attribution required.
 
-| Bank PDF | Page Count | Transaction Count | Execution Time | Math Integrity |
-| :--- | :---: | :---: | :---: | :---: |
-| `HDFC.pdf` | 147 pages | 1,601 txs | **~0.8 seconds** | 🟢 **100% Consistent (0 Warnings)** |
-| `SBI.pdf` | 13 pages | 167 txs | **~0.2 seconds** | 🟢 **100% Consistent (0 Warnings)** |
-| `IOB.pdf` | 22 pages | 693 txs | **~0.3 seconds** | 🟢 **100% Consistent (0 Warnings)** |
-| `Canara.pdf` | 34 pages | 521 txs | **~0.4 seconds** | 🟢 **100% Consistent (0 Warnings)** |
-| `Indianbank.pdf` | 5 pages | 30 txs | **~0.1 seconds** | 🟢 **100% Consistent (0 Warnings)** |
+### Disclaimer
 
----
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-## 📄 License
-
-This project is licensed under the MIT License — free for personal and commercial use.
+This tool performs automated extraction of financial data and may produce parsing errors, math discrepancies, or incomplete output. **Always verify parsed results against the original PDF before relying on them for accounting, tax, legal, or any other financial purposes.** Use at your own risk.
