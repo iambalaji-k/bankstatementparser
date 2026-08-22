@@ -14,11 +14,16 @@ import csv
 import argparse
 import warnings
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 # Module-level compiled date sub-patterns
-MONTH_PATTERN = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$')
+MONTH_PATTERN = re.compile(r'^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$', re.IGNORECASE)
 YEAR_PATTERN = re.compile(r'^\d{4}$')
+
+# Tolerant combined "dd Mon yyyy" matcher for split-date layouts (Indian Bank):
+# joins all words in the date column first, so tokenizer differences (e.g. "05 Apr"
+# extracted as one word, single-digit days, trailing period) don't break anchoring.
+SPLIT_DATE_PATTERN = re.compile(r'^(\d{1,2})\s+([A-Za-z]{3})\.?\s+(\d{4})$')
 
 # Try to import fitz (PyMuPDF) or pdfplumber
 HAS_FITZ = False
@@ -76,6 +81,7 @@ class BankProfile:
     vdate_pattern: re.Pattern | None = None
     iob_block_offset_before: float = 6.0
     iob_block_offset_after: float = 15.0
+    adaptive_bounds: bool = False  # derive column bounds from page-1 header row
 
 
 BANK_PROFILES = {
@@ -183,7 +189,8 @@ BANK_PROFILES = {
         date_type='split_3',
         debit_dash_x_range=(305.0, 308.0),
         credit_dash_x_range=(400.0, 403.0),
-        currency_prefix='INR'
+        currency_prefix='INR',
+        adaptive_bounds=True
     )
 }
 
@@ -311,6 +318,198 @@ class BankStatementParser:
                 if pre_parts:
                     raw_txs[-1]['narration'] += " " + " ".join(pre_parts)
 
+    def _infer_split_amounts(self, raw_txs, balance_val, debit_val, credit_val):
+        """Balance-chain inference for split-date profiles (Indian Bank).
+
+        Uses the running balance delta to validate and, if needed, repair the
+        withdrawal/deposit assignment. Parsed values (dash indicators + column
+        extraction) act as hints; the mathematically implied amounts win on any
+        conflict. Returns the (withdrawal, deposit) pair to store.
+        """
+        if not raw_txs:
+            # First transaction of the statement: no previous balance to infer from.
+            return debit_val, credit_val
+
+        prev_balance = raw_txs[-1]['balance']
+        delta = round(balance_val - prev_balance, 2)
+
+        if abs(delta) < 0.005:
+            exp_debit, exp_credit = None, None
+        elif delta < 0:
+            exp_debit, exp_credit = round(-delta, 2), None
+        else:
+            exp_debit, exp_credit = None, round(delta, 2)
+
+        def _matches(parsed, expected):
+            if expected is None:
+                return parsed is None
+            return parsed is not None and abs(parsed - expected) <= 0.02
+
+        if _matches(debit_val, exp_debit) and _matches(credit_val, exp_credit):
+            return debit_val, credit_val
+
+        print(f"  Amount inference: repaired W/D from balance chain (delta {delta:+.2f}; "
+              f"parsed W={debit_val}, D={credit_val} -> W={exp_debit}, D={exp_credit})")
+        return exp_debit, exp_credit
+
+    def _infer_chain_amounts(self, txs):
+        """Balance-chain validation/repair pass over a CHRONOLOGICAL transaction list.
+
+        Used for reverse-chronological profiles (IOB) after re-sorting: the running
+        balance delta mathematically determines withdrawal vs deposit, so parsed
+        values that disagree with the chain are corrected (loudly).
+        """
+        repaired = 0
+
+        def _matches(parsed, expected):
+            if expected is None:
+                return parsed is None
+            return parsed is not None and abs(parsed - expected) <= 0.02
+
+        for i in range(1, len(txs)):
+            prev_bal = txs[i - 1]['balance']
+            bal = txs[i]['balance']
+            delta = round(bal - prev_bal, 2)
+
+            if abs(delta) < 0.005:
+                exp_w, exp_d = None, None
+            elif delta < 0:
+                exp_w, exp_d = round(-delta, 2), None
+            else:
+                exp_w, exp_d = None, round(delta, 2)
+
+            w, d = txs[i]['withdrawal'], txs[i]['deposit']
+            if _matches(w, exp_w) and _matches(d, exp_d):
+                continue
+
+            repaired += 1
+            if repaired <= 10:
+                print(f"  Amount inference: repaired W/D from balance chain (delta {delta:+.2f}; "
+                      f"parsed W={w}, D={d} -> W={exp_w}, D={exp_d})")
+            txs[i]['withdrawal'], txs[i]['deposit'] = exp_w, exp_d
+
+        if repaired:
+            print(f"  Amount inference: {repaired} transaction(s) repaired via balance chain.")
+        return txs
+
+    def _parse_amount_text(self, text):
+        """Normalizes an amount token: strips currency prefixes/symbols (INR, Rs, \u20b9)
+        and trailing Dr/Cr suffixes, handles parenthesized negatives, then cleans."""
+        if not text:
+            return None
+        t = str(text).strip()
+        t = re.sub(r'(?i)\b(?:INR|RS)\b\.?', '', t)
+        t = t.replace('\u20b9', '')
+        neg = t.startswith('(') and t.endswith(')')
+        if neg:
+            t = t[1:-1]
+        t = re.sub(r'(?i)(?:DR|CR)\.?$', '', t).strip()
+        val = self.clean_amount(t)
+        if val is not None and neg:
+            val = -val
+        return val
+
+    def _first_amount_in_range(self, line_words, x0, x1):
+        """Returns the first parseable amount among words whose x0 falls within [x0, x1].
+
+        Unlike a plain first-word grab, tokens that fail a naive float parse (e.g.
+        'INR', '1,234.56Dr') don't abort the scan \u2014 subsequent words are still tried.
+        """
+        for w in line_words:
+            if x0 <= w.x0 <= x1:
+                val = self._parse_amount_text(w.text)
+                if val is not None:
+                    return val
+        return None
+
+    def _apply_adaptive_bounds(self, words, profile):
+        """Derives column x-bounds from the page-1 header row instead of static points.
+
+        Locates the header line (the one mentioning several column labels), computes
+        each column's center from its label position, and places boundaries at the
+        midpoints between adjacent centers. Falls back to the profile's static bounds
+        when the header cannot be reliably recognized or the geometry looks wrong.
+        """
+        grouped = {}
+        for w in words:
+            placed = False
+            for gk in grouped.keys():
+                if abs(gk - w.top) < profile.line_group_tolerance:
+                    grouped[gk].append(w)
+                    placed = True
+                    break
+            if not placed:
+                grouped[w.top] = [w]
+
+        classifiers = (
+            (('date',), 'date'),
+            (('descr', 'narration', 'particul', 'transaction', 'details'), 'narration'),
+            (('debit', 'withdrawal'), 'withdrawal'),
+            (('credit', 'deposit'), 'deposit'),
+            (('balance',), 'balance'),
+        )
+        order = ['date', 'narration', 'withdrawal', 'deposit', 'balance']
+
+        header_centers = None
+        for gk in sorted(grouped.keys()):
+            line_words = sorted(grouped[gk], key=lambda w: w.x0)
+            col_words = {}
+            for w in line_words:
+                lt = w.text.lower()
+                for needles, col in classifiers:
+                    if any(n in lt for n in needles):
+                        col_words.setdefault(col, []).append(w)
+                        break
+            if not all(c in col_words for c in ('withdrawal', 'deposit', 'balance')):
+                continue
+            centers = {}
+            for col, ws in col_words.items():
+                ws = sorted(ws, key=lambda w: w.x0)
+                # Merge adjacent label words into one extent (e.g. 'Transaction' + 'Details');
+                # keep only the leftmost contiguous group (e.g. 'Txn Date' vs 'Value Date').
+                group = [ws[0]]
+                for w in ws[1:]:
+                    if w.x0 - group[-1].x1 < 10.0:
+                        group.append(w)
+                    else:
+                        break
+                centers[col] = (group[0].x0 + group[-1].x1) / 2
+            header_centers = centers
+            break
+
+        if header_centers is None:
+            print("Adaptive bounds: header row not recognized; keeping static column bounds.")
+            return profile
+
+        present = [c for c in order if c in header_centers]
+        cs = [header_centers[c] for c in present]
+        # Sanity: centers must be strictly increasing with meaningful spacing
+        if any(cs[i + 1] - cs[i] < 20.0 for i in range(len(cs) - 1)):
+            print("Adaptive bounds: implausible header geometry; keeping static column bounds.")
+            return profile
+
+        new_bounds = dict(profile.col_bounds)
+        n = len(present)
+        for i, col in enumerate(present):
+            left = (cs[i - 1] + cs[i]) / 2 if i > 0 else max(0.0, cs[0] - 45.0)
+            right = (cs[i] + cs[i + 1]) / 2 if i < n - 1 else cs[-1] + 60.0
+            new_bounds[col] = (left, right)
+
+        # Safety net: every derived bound must overlap the known-good static bound,
+        # otherwise the header was misread and we fall back to static bounds entirely.
+        for col in present:
+            static = profile.col_bounds.get(col)
+            if static:
+                d0, d1 = new_bounds[col]
+                if d1 < static[0] or d0 > static[1]:
+                    print(f"Adaptive bounds: derived '{col}' ({d0:.0f}-{d1:.0f}) doesn't overlap "
+                          f"static ({static[0]:.0f}-{static[1]:.0f}); keeping static column bounds.")
+                    return profile
+
+        print("Adaptive bounds derived from page-1 header: "
+              + ", ".join(f"{c}={new_bounds[c][0]:.0f}-{new_bounds[c][1]:.0f}" for c in present))
+        return replace(profile, col_bounds=new_bounds)
+
     # ── Universal Unified Parsing Engine ─────────────────────────────────
 
     def parse(self):
@@ -378,6 +577,10 @@ class BankStatementParser:
 
                 page = get_page(page_idx)
                 words = self._extract_words(page, engine)
+
+                # Derive column bounds from the page-1 header row (once, reused for all pages)
+                if page_idx == 0 and profile.adaptive_bounds:
+                    profile = self._apply_adaptive_bounds(words, profile)
 
                 min_y = profile.page1_min_y if page_idx == 0 else profile.pageN_min_y
                 table_words = [w for w in words if min_y <= w.top <= profile.max_y]
@@ -498,18 +701,18 @@ class BankStatementParser:
                             })
 
                 elif profile.date_type == "split_3":
+                    # Tolerant anchor: join all words in the date column, then match
+                    # a combined dd Mon yyyy pattern (case-insensitive month, 1-2 digit day).
                     date_ys = []
                     for gk in valid_ys:
                         line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
-                        date_words = [w for w in line_words if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]]
-                        if len(date_words) >= 3:
-                            day_text = date_words[0].text
-                            month_text = date_words[1].text
-                            year_text = date_words[2].text
-                            if (profile.date_pattern.match(day_text) and
-                                MONTH_PATTERN.match(month_text) and
-                                YEAR_PATTERN.match(year_text)):
-                                date_ys.append((gk, f"{day_text} {month_text} {year_text}"))
+                        joined = " ".join(w.text for w in line_words if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]).strip()
+                        m = SPLIT_DATE_PATTERN.match(joined)
+                        if m:
+                            day_text = m.group(1).zfill(2)
+                            month_text = m.group(2).title()
+                            year_text = m.group(3)
+                            date_ys.append((gk, f"{day_text} {month_text} {year_text}"))
 
                     # Universal cross-page narration overflow check
                     self._handle_cross_page_continuation(raw_txs, valid_ys, date_ys, grouped_lines, profile)
@@ -553,21 +756,29 @@ class BankStatementParser:
                                 x_min, x_max = profile.credit_dash_x_range
                                 credit_indicator = any(x_min <= w.x0 <= x_max and w.text == '-' for w in line_words)
 
+                            # Guarded assignment: narration-overflow lines carry no
+                            # amounts, so a None result must NOT clobber values already
+                            # captured from the anchor row.
                             if not debit_indicator:
-                                d_words = [w for w in line_words if wx0 <= w.x0 <= wx1 and w.text != profile.currency_prefix]
-                                if d_words:
-                                    debit_val = self.clean_amount(d_words[0].text)
+                                val = self._first_amount_in_range(line_words, wx0, wx1)
+                                if val is not None:
+                                    debit_val = val
 
                             if not credit_indicator:
-                                c_words = [w for w in line_words if dx0 <= w.x0 <= dx1 and w.text != profile.currency_prefix]
-                                if c_words:
-                                    credit_val = self.clean_amount(c_words[0].text)
+                                val = self._first_amount_in_range(line_words, dx0, dx1)
+                                if val is not None:
+                                    credit_val = val
 
-                            b_words = [w for w in line_words if bx0 <= w.x0 <= bx1 and w.text != profile.currency_prefix]
-                            if b_words:
-                                balance_val = self.clean_amount(b_words[0].text)
+                            val = self._first_amount_in_range(line_words, bx0, bx1)
+                            if val is not None:
+                                balance_val = val
 
                         if date_text and balance_val is not None:
+                            # Balance-chain inference/repair: the running balance delta
+                            # mathematically determines withdrawal vs deposit. Parsed
+                            # values are kept only when they agree with the chain.
+                            debit_val, credit_val = self._infer_split_amounts(
+                                raw_txs, balance_val, debit_val, credit_val)
                             raw_txs.append({
                                 'date': date_text,
                                 'narration': " ".join(narration_parts).strip(),
@@ -580,25 +791,40 @@ class BankStatementParser:
                             })
 
                 elif profile.date_type == "iob":
-                    bal_ys = []
                     bal_bounds = profile.col_bounds.get('balance')
                     if not bal_bounds:
                         raise ValueError(f"Bank profile '{profile.name}' is missing required 'balance' column bounds")
                     bal_x0 = bal_bounds[0]
 
+                    # Locate date-bearing lines: a genuine IOB row has its date line a
+                    # few points ABOVE the amounts line that carries the balance.
+                    date_line_ys = set()
+                    for gk in valid_ys:
+                        line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
+                        dt_text = " ".join(w.text for w in line_words if profile.date_x_range[0] <= w.x0 <= profile.date_x_range[1]).strip()
+                        if profile.date_pattern.match(dt_text):
+                            date_line_ys.add(gk)
+
+                    # Anchor candidates with validation: only accept balance-column numbers
+                    # that have a date line immediately above them. Stray numbers (page
+                    # artifacts, summary fragments) no longer create phantom anchors that
+                    # split neighbouring transactions' blocks.
+                    bal_ys = []
                     for gk in valid_ys:
                         line_words = sorted(grouped_lines[gk], key=lambda w: w.x0)
                         for w in line_words:
                             if w.x0 >= bal_x0 and w.text not in ('-', '(', ')'):
-                                val = self.clean_amount(w.text)
+                                val = self._parse_amount_text(w.text)
                                 if val is not None:
-                                    bal_ys.append((gk, val))
+                                    if any(0 < gk - d <= 12.0 for d in date_line_ys):
+                                        bal_ys.append((gk, val))
                                     break
 
-                    # Universal cross-page narration overflow check for IOB
+                    # Cross-page narration overflow: pre-anchor lines at the top of a page
+                    # always continue the narration of the previous page's final transaction
+                    # (raw_txs[-1]), regardless of within-page chronological direction.
                     anchor_date_ys = [(by, "") for by, _ in bal_ys]
-                    if profile.chronological:
-                        self._handle_cross_page_continuation(raw_txs, valid_ys, anchor_date_ys, grouped_lines, profile)
+                    self._handle_cross_page_continuation(raw_txs, valid_ys, anchor_date_ys, grouped_lines, profile)
 
                     narration_bounds = profile.col_bounds.get('narration')
                     wx0, wx1 = profile.col_bounds['withdrawal']
@@ -607,7 +833,7 @@ class BankStatementParser:
                     for i, (by, bal_val) in enumerate(bal_ys):
                         next_by = bal_ys[i + 1][0] if i + 1 < len(bal_ys) else None
                         block_start = by - profile.iob_block_offset_before
-                        block_end = (next_by - profile.iob_block_offset_before) if next_by is not None else (by + profile.iob_block_offset_after)
+                        block_end = (next_by - profile.iob_block_offset_before) if next_by is not None else (valid_ys[-1] + 1)
                         block_ys = [gk for gk in valid_ys if block_start <= gk < block_end]
 
                         date_text, val_date_text, ref_text = self._extract_iob_dates_and_ref(block_ys, grouped_lines, profile)
@@ -624,14 +850,14 @@ class BankStatementParser:
                                 if n_words:
                                     narration_parts.append(" ".join(n_words))
 
-                            for w in line_words:
-                                val = self.clean_amount(w.text)
-                                if val is None:
-                                    continue
-                                if wx0 <= w.x0 < wx1:
-                                    debit_val = val
-                                elif dx0 <= w.x0 < dx1:
-                                    credit_val = val
+                            # Guarded hardened extraction: dashes/none-values return None
+                            # and must not clobber values captured from earlier lines.
+                            val = self._first_amount_in_range(line_words, wx0, wx1)
+                            if val is not None:
+                                debit_val = val
+                            val = self._first_amount_in_range(line_words, dx0, dx1)
+                            if val is not None:
+                                credit_val = val
 
                         if date_text and bal_val is not None:
                             raw_txs.append({
@@ -657,6 +883,8 @@ class BankStatementParser:
             for p in sorted(page_groups.keys(), reverse=True):
                 result.extend(reversed(page_groups[p]))
             raw_txs = result
+            # Now in chronological order: validate/repair W/D via the balance chain.
+            raw_txs = self._infer_chain_amounts(raw_txs)
 
         print(f"Extraction complete. Found {len(raw_txs)} raw transactions.")
         return raw_txs

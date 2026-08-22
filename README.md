@@ -12,11 +12,11 @@ No manual copy-pasting. No OCR guesswork. No broken columns. Just point it at a 
 
 ## ✨ Why You'll Love It
 
-- 🎯 **Coordinate-Based Precision** — Instead of fragile text scraping, every word is extracted with its exact x/y position on the page. Withdrawals, deposits, and balances land in the right column *every time*, even with multi-line narrations.
-- 🧮 **Mathematical Integrity Guarantee** — Every parsed row is verified against the accounting equation `previous balance − withdrawal + deposit = balance`. If the math doesn't add up, you'll know immediately — parsing errors can't hide.
+- 🎯 **Coordinate-Based Precision & Adaptive Bounds** — Instead of fragile text scraping, every word is extracted with its exact x/y position. For variable layouts, header geometry is dynamically analyzed to derive exact column boundaries at runtime.
+- 🧮 **Mathematical Integrity Guarantee & Self-Healing** — Every parsed row is verified against the accounting equation `previous balance − withdrawal + deposit = balance`. Built-in balance-chain inference automatically validates and repairs debit/credit misassignments.
 - 🤖 **Automatic Bank Detection** — The parser reads page 1 and figures out which bank's layout it's dealing with. Zero configuration required.
-- 🔀 **Cross-Page Continuation** — Narrations that wrap across page boundaries are automatically stitched back onto the right transaction.
-- 🔄 **Reverse-Chronological Handling** — IOB statements list transactions newest-first; the parser detects this and re-sorts everything chronologically for you.
+- 🔀 **Cross-Page Continuation** — Narrations that wrap across page boundaries are automatically stitched back onto the right transaction without clobbering extracted amounts.
+- 🔄 **Reverse-Chronological Handling** — IOB statements list transactions newest-first; the parser detects this, re-sorts everything chronologically, and validates the full balance chain.
 - 🏷️ **Smart Auto-Categorization** — Every transaction is classified into categories like UPI, IMPS, NEFT, RTGS, ATM, Salary, Loan EMI, Investments, and more — ready for pivot tables and spending analysis.
 - 📊 **Gorgeous Excel Output** — Styled workbooks with navy headers, right-aligned currency columns, `#,##0.00` number formatting, and auto-sized columns. Open it and send it.
 - ⚡ **Blazing Fast** — Powered by PyMuPDF's low-level C bindings, hundreds of pages parse in under a second.
@@ -29,9 +29,9 @@ No manual copy-pasting. No OCR guesswork. No broken columns. Just point it at a 
 | :--- | :---: | :---: | :--- |
 | **HDFC Bank** | `hdfc` | `DD/MM/YY(YY)` | Separate value-date column, summary footer suppression |
 | **State Bank of India** | `sbi` | `DD/MM/YYYY` | Computer-generated disclaimer footers, per-page headers |
-| **Indian Overseas Bank** | `iob` | `DD-Mon-YY` | Balance-anchored blocks, value dates in parentheses, reverse-chronological order |
+| **Indian Overseas Bank** | `iob` | `DD-Mon-YY` | Date-validated balance anchors, value dates in parentheses, reverse-chronological order |
 | **Canara Bank** | `canara` | `DD-Mon-YY` | Taller pages (`max_y=840`), no chq/ref or value-date columns |
-| **Indian Bank** | `indianbank` | `DD Mon YYYY` | Dates split across three words, dash indicators for empty amount cells, `INR` currency prefixes |
+| **Indian Bank** | `indianbank` | `DD Mon YYYY` | Adaptive header bounds, flexible split-date tokenizer matching, dash amount indicators, balance-chain repair |
 
 > 🚧 **More banks are on the way!** New bank profiles will be added in future releases — see the [Roadmap](#🗺️-roadmap).
 
@@ -103,12 +103,13 @@ The parser treats each PDF as a coordinate system, not a document. Here's the pi
 
 ```
 PDF ─▶ Extract words + x/y coordinates (PyMuPDF ▶ pdfplumber fallback)
+   ─▶ Derive adaptive column bounds from page-1 header (if configured)
    ─▶ Filter header/footer zones using per-bank y-cutoffs
    ─▶ Group words into horizontal lines by y-tolerance
    ─▶ Drop column-header rows & footer summary blocks (keyword matching)
-   ─▶ Segment lines into transactions between date anchors
+   ─▶ Segment lines into transactions between date/balance anchors
    ─▶ Append cross-page narration overflow to the previous transaction
-   ─▶ Validate math: prev_balance − withdrawal + deposit == balance
+   ─▶ Validate & self-repair math via balance chain: prev_balance − withdrawal + deposit == balance
    ─▶ Auto-categorize → write styled CSV + XLSX
 ```
 
@@ -117,8 +118,8 @@ PDF ─▶ Extract words + x/y coordinates (PyMuPDF ▶ pdfplumber fallback)
 Different banks lay out transactions differently, so the engine supports three ways of finding where each transaction starts:
 
 1. **`single`** *(HDFC, SBI, Canara)* — A line whose leftmost column matches the bank's date regex starts a new transaction. Everything until the next date belongs to it.
-2. **`split_3`** *(Indian Bank)* — Dates arrive as three separate words (`15` `Aug` `2025`) in the date column; all three must match before a transaction anchor is recognized.
-3. **`iob`** *(IOB)* — Dates are unreliable, so transactions are anchored to **balance values** instead, with configurable y-offsets defining each block. Reverse-chronological pages are re-sorted at the end.
+2. **`split_3`** *(Indian Bank)* — Dates arrive across split words (`15` `Aug` `2025`); a tolerant multi-token regex matcher joins date-zone text to reliably anchor even when tokenized irregularly.
+3. **`iob`** *(IOB)* — Transactions are anchored to **date-validated balance values**, with configurable y-offsets defining each block. Reverse-chronological pages are re-sorted and balance-chain verified at the end.
 
 ---
 
@@ -151,6 +152,7 @@ All bank-specific behavior lives in declarative `BankProfile` dataclasses inside
 | `line_group_tolerance` | Max y-distance between words considered part of one line |
 | `debit_dash_x_range` / `credit_dash_x_range` | Exact positions of `-` placeholders in amount columns (Indian Bank) |
 | `currency_prefix` | Currency token to ignore while scanning amounts (e.g. `INR`) |
+| `adaptive_bounds` | If `True`, dynamically calculates column x-boundaries from page-1 table header positions |
 
 ---
 
